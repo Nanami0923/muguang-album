@@ -30,6 +30,9 @@ internal data class AlbumEntity(
     val motionMode: String = "OFF", val motionStrength: Float = .12f,
     val maxCrop: Float = .4f, val blurBackground: Boolean = false,
     val playbackCategories: String = "",
+    val transitionEffect: String = "RANDOM",
+    val focusDurationSeconds: Int = 6,
+    @androidx.room.ColumnInfo(defaultValue = "'LOCAL_FOLDER'") val musicSourceType: String = "LOCAL_FOLDER",
 )
 
 @Entity(
@@ -119,6 +122,18 @@ internal data class ScheduleEntity(
 
 @Dao
 internal interface AlbumDao {
+    @Query("SELECT photos.* FROM photos INNER JOIN sources ON sources.id = photos.sourceId WHERE photos.trashedAt IS NULL AND sources.available = 1 AND photos.analysis_taskState = 'DONE' AND photos.analysis_aiStatus = 'QUEUED' LIMIT 1")
+    suspend fun nextAi(): PhotoEntity?
+    @Query("UPDATE photos SET analysis_aiStatus = 'UNKNOWN_OUTCOME', analysis_aiError = '上次调用中断，可能已计费；请确认后手动重试' WHERE analysis_aiStatus = 'PROCESSING'")
+    suspend fun recoverAi()
+    @Query("UPDATE photos SET analysis_aiStatus = 'QUEUED' WHERE analysis_aiStatus = 'WAITING_CONFIG'")
+    suspend fun queueConfiguredAi()
+    @Query("SELECT * FROM ai_results WHERE cacheKey = :key")
+    suspend fun aiCache(key: String): AiResultEntity?
+    @Query("DELETE FROM ai_results WHERE cacheKey = :key")
+    suspend fun deleteAiCache(key: String)
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun saveAiCache(result: AiResultEntity)
     @Query("SELECT * FROM photos WHERE id = :id")
     suspend fun photosById(id: String): List<PhotoEntity>
     @Query("SELECT * FROM photos WHERE sourceId = :sourceId")
@@ -136,14 +151,17 @@ internal interface AlbumDao {
     @Query("UPDATE sources SET analysisState = :state WHERE id = :id")
     suspend fun analysisState(id: String, state: String)
 
-    @Query("UPDATE photos SET trashedAt = COALESCE(trashedAt, :now), unavailableReason = :reason WHERE sourceId = :sourceId")
+    @Query("UPDATE photos SET trashedAt = COALESCE(trashedAt, :now), unavailableReason = :reason WHERE sourceId = :sourceId AND (unavailableReason IS NULL OR unavailableReason != '已从当前相册移除')")
     suspend fun trashSource(sourceId: String, now: Long, reason: String)
 
-    @Query("DELETE FROM photos WHERE trashedAt IS NOT NULL AND trashedAt <= :cutoff")
+    @Query("DELETE FROM photos WHERE trashedAt IS NOT NULL AND trashedAt <= :cutoff AND (unavailableReason IS NULL OR unavailableReason != '已从当前相册移除')")
     suspend fun purgeTrash(cutoff: Long)
 
     @Query("UPDATE albums SET motionMode = :mode, motionStrength = :strength, maxCrop = :crop, blurBackground = :blur, playbackCategories = :categories WHERE id = :id")
     suspend fun smartSettings(id: String, mode: String, strength: Float, crop: Float, blur: Boolean, categories: String)
+
+    @Query("UPDATE albums SET transitionEffect = :effect, focusDurationSeconds = :duration WHERE id = :id")
+    suspend fun animationSettings(id: String, effect: String, duration: Int)
 
     @Query("SELECT * FROM albums ORDER BY rowid")
     fun observeAlbums(): Flow<List<AlbumEntity>>
@@ -242,9 +260,21 @@ internal interface AlbumDao {
     suspend fun deleteSchedule(id: String)
 }
 
+@Entity(tableName = "ai_results")
+internal data class AiResultEntity(
+    @PrimaryKey val cacheKey: String,
+    val fingerprint: String,
+    val result: String,
+    val model: String,
+    val requestId: String?,
+    val inputTokens: Long?,
+    val outputTokens: Long?,
+    val createdAt: Long,
+)
+
 @Database(
-    entities = [AlbumEntity::class, SourceEntity::class, PhotoEntity::class, TrackEntity::class, ScheduleEntity::class],
-    version = 2,
+    entities = [AlbumEntity::class, SourceEntity::class, PhotoEntity::class, TrackEntity::class, ScheduleEntity::class, AiResultEntity::class],
+    version = 4,
     exportSchema = true,
 )
 internal abstract class AlbumDatabase : RoomDatabase() {

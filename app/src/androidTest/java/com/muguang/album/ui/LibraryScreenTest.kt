@@ -29,6 +29,117 @@ class LibraryScreenTest {
 
     private val album = Album(id = "family", name = "家庭相册")
 
+    @Test fun longPressShowsActionsAndReanalysisTargetsOnlyTheChosenPhoto() {
+        val source = FolderSource("photos", album.id, "content://test/photos", "测试照片", SourceKind.PHOTO)
+        val photo = Photo("photo-1", source.id, "content://test/photo-1", "选中的照片.jpg")
+        val recorder = show(LibraryState(albums = listOf(album), sources = listOf(source), photos = listOf(photo), initialized = true))
+        compose.onNodeWithTag("photo-library-grid").performScrollToIndex(5)
+        compose.onNodeWithTag("photo-tile-photo-1").performTouchInput { longClick() }
+        compose.onNodeWithText("图片操作").assertIsDisplayed()
+        compose.onNodeWithText("仅从当前相册移除，保留原图。").assertIsDisplayed()
+        compose.onNodeWithTag("focus-image").assertDoesNotExist()
+        captureActions("photo-long-press.png")
+        compose.onNodeWithTag("photo-action-reanalyze").performClick()
+        compose.onNodeWithText("图片操作").assertDoesNotExist()
+        compose.runOnIdle { assertEquals(listOf("reanalyze:photos:photo-1"), recorder.calls) }
+    }
+
+    @Test fun removalRequiresConfirmationAndCanBeRestoredFromTrash() {
+        val source = FolderSource("photos", album.id, "content://test/photos", "测试照片", SourceKind.PHOTO)
+        val photo = Photo("photo-1", source.id, "content://test/photo-1", "选中的照片.jpg")
+        val recorder = show(LibraryState(albums = listOf(album), sources = listOf(source), photos = listOf(photo), initialized = true))
+        val grid = compose.onNodeWithTag("photo-library-grid")
+        grid.performScrollToIndex(5)
+        compose.onNodeWithTag("photo-tile-photo-1").performTouchInput { longClick() }
+        compose.onNodeWithTag("photo-action-remove").performClick()
+        compose.onNodeWithText("从当前相册删除？").assertIsDisplayed()
+        captureActions("photo-remove-confirmation.png")
+        compose.onNodeWithText("取消").performClick()
+        compose.runOnIdle { assertTrue(recorder.calls.isEmpty()) }
+        compose.onNodeWithTag("photo-tile-photo-1").assertExists().performTouchInput { longClick() }
+        compose.onNodeWithTag("photo-action-remove").performClick()
+        compose.onNodeWithTag("confirm-remove-photo").performClick()
+        compose.onNodeWithTag("photo-tile-photo-1").assertDoesNotExist()
+        grid.performScrollToIndex(4)
+        compose.onNodeWithTag("library-status-filters").performScrollToNode(hasText("回收站"))
+        compose.onNodeWithText("回收站").performClick()
+        compose.onNodeWithTag("restore-photo-photo-1").performClick()
+        compose.onNodeWithText("关闭").performClick()
+        grid.performScrollToIndex(5)
+        compose.onNodeWithTag("photo-tile-photo-1").assertExists()
+        compose.runOnIdle { assertEquals(listOf("remove:photos:photo-1", "restore:photos:photo-1"), recorder.calls) }
+    }
+
+    @Test fun fiveSlotsSeparateAiAndTheCenterActionStartsTheCurrentAlbumWithoutNavigating() {
+        val source = FolderSource("photos", album.id, "content://test/photos", "测试照片", SourceKind.PHOTO)
+        val photo = Photo("p", source.id, "content://test/p", "照片.jpg")
+        val recorder = show(LibraryState(albums = listOf(album), sources = listOf(source), photos = listOf(photo), initialized = true))
+        listOf("nav-albums", "nav-ai", "start-slideshow", "nav-playback", "nav-settings").forEach {
+            compose.onNodeWithTag(it).assertIsDisplayed()
+        }
+        val slots = listOf("nav-albums", "nav-ai", "start-slideshow", "nav-playback", "nav-settings").map {
+            compose.onNodeWithTag(it).getUnclippedBoundsInRoot()
+        }
+        assertTrue(slots.zipWithNext().all { (a, b) -> a.left < b.left })
+        captureActions("v031-navigation.png")
+        compose.onNodeWithTag("nav-ai").performClick().assertIsSelected()
+        compose.onNodeWithText("AI 图片识别").assertIsDisplayed()
+        captureActions("v031-ai.png")
+        compose.onNodeWithTag("start-slideshow").performClick()
+        compose.onNodeWithTag("nav-ai").assertIsSelected()
+        compose.runOnIdle { assertEquals(listOf("play:family"), recorder.calls) }
+        compose.onNodeWithTag("nav-settings").performClick()
+        compose.onNodeWithTag("ai-enabled").assertDoesNotExist()
+        compose.onNodeWithTag("nav-albums").performClick()
+        compose.onNodeWithContentDescription("移除此相册").performClick()
+        compose.onNodeWithText("移除“家庭相册”？").assertIsDisplayed()
+        compose.onNodeWithText("取消").performClick()
+    }
+
+    @Test fun centerActionExplainsEmptyAlbumsAndDoesNotStartPlayback() {
+        val recorder = show(LibraryState(albums = listOf(album), initialized = true))
+        compose.onNodeWithTag("start-slideshow").performClick()
+        compose.onNodeWithTag("nav-albums").assertIsSelected()
+        compose.runOnIdle {
+            assertTrue(recorder.calls.single().startsWith("message:当前相册没有可播放的照片"))
+        }
+    }
+
+    @Test fun playbackSettingsSaveEffectBothSpeedsAndCustomFocusDuration() {
+        val recorder = show(LibraryState(albums = listOf(album), initialized = true))
+        compose.onNodeWithTag("nav-playback").performClick()
+        compose.onNodeWithTag("effect-RANDOM").performScrollTo().assertIsSelected()
+        compose.onNodeWithTag("effect-CUBE").performScrollTo().performClick()
+        compose.onNodeWithTag("transition-speed-LOW").performScrollTo().performClick()
+        captureActions("v031-transitions.png")
+        compose.onNodeWithTag("focus-animation-enabled").performScrollTo().performClick()
+        compose.onNodeWithTag("focus-speed-HIGH").performScrollTo().performClick()
+        compose.onNodeWithTag("focus-duration").performScrollTo().performTextClearance()
+        compose.onNodeWithText("保存设置").assertIsNotEnabled()
+        compose.onNodeWithTag("focus-duration").performTextInput("4")
+        captureActions("v031-focus.png")
+        compose.onNodeWithText("保存设置").performScrollTo().performClick()
+        compose.runOnIdle {
+            val saved = recorder.updatedAlbum!!
+            assertEquals(com.muguang.album.core.SlideEffect.CUBE, saved.transitionEffect)
+            assertEquals(1200, saved.transitionMillis)
+            assertEquals(com.muguang.album.core.MotionMode.FIT_ZOOM, saved.motionMode)
+            assertEquals(4, saved.focusDurationSeconds)
+        }
+    }
+
+    private fun captureActions(name: String) {
+        compose.waitForIdle()
+        val instrumentation = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation()
+        instrumentation.waitForIdleSync()
+        android.os.SystemClock.sleep(750) // Let the native dialog window animation settle.
+        val directory = java.io.File(instrumentation.targetContext.getExternalFilesDir(null), "photo-actions").apply { mkdirs() }
+        instrumentation.uiAutomation.takeScreenshot()?.let { image ->
+            java.io.File(directory, name).outputStream().use { image.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
+            image.recycle()
+        }
+    }
+
     @Test fun previewLayoutSwitchesBetweenOneAndTwoColumns() {
         val source=FolderSource("photos",album.id,"content://test/photos","测试照片",SourceKind.PHOTO)
         val photos=(1..20).map { Photo("photo-$it",source.id,"content://test/photo-$it","照片$it.jpg") }
@@ -52,13 +163,14 @@ class LibraryScreenTest {
         assertTrue(secondDouble.left>firstDouble.left)
     }
 
-    @Test fun scrollingPhotosMovesThePlaybackCardOffScreen() {
+    @Test fun scrollingPhotosKeepsTheCenterPlayActionVisible() {
         val source = FolderSource("photos",album.id,"content://test/photos","测试照片",SourceKind.PHOTO)
         val photos = (1..80).map { Photo("photo-$it",source.id,"content://test/photo-$it","照片$it.jpg") }
         show(LibraryState(albums=listOf(album),sources=listOf(source),photos=photos,initialized=true))
-        compose.onNodeWithText("开始播放").assertIsDisplayed()
-        compose.onNodeWithTag("photo-library-grid").performScrollToIndex(40)
         compose.onNodeWithText("开始播放").assertDoesNotExist()
+        compose.onNodeWithTag("start-slideshow").assertIsDisplayed()
+        compose.onNodeWithTag("photo-library-grid").performScrollToIndex(40)
+        compose.onNodeWithTag("start-slideshow").assertIsDisplayed()
         compose.onNodeWithTag("photo-library-grid").assertIsDisplayed()
     }
 
@@ -79,6 +191,7 @@ class LibraryScreenTest {
 
         compose.onNodeWithText("设置").performClick()
         compose.onNodeWithText("相框设置").assertIsDisplayed()
+        compose.onNodeWithTag("settings-list").performScrollToNode(hasTestTag("setting-clock"))
         compose.onNodeWithTag("setting-clock").assertIsOff().performClick().assertIsOn()
         compose.onNodeWithTag("settings-list").performScrollToNode(hasTestTag("setting-reminders"))
         compose.onNodeWithTag("setting-reminders").assertIsOff().performClick().assertIsOn()
@@ -96,7 +209,8 @@ class LibraryScreenTest {
     fun creatingAWeekdayScheduleSendsTheSelectedAlbumAndRepeatDays() {
         val recorder = show(LibraryState(albums = listOf(album), initialized = true))
 
-        compose.onNodeWithText("定时").performClick()
+        compose.onNodeWithTag("nav-playback").performClick()
+        compose.onNodeWithText("定时计划").performClick()
         compose.onNodeWithContentDescription("新建播放计划").performClick()
         compose.onNodeWithText("计划名称（可选）").performTextInput("白天展示")
         compose.onNodeWithText("工作日").performScrollTo().performClick()
@@ -118,7 +232,8 @@ class LibraryScreenTest {
     fun aScheduleWithNoSelectedDaysIsNotSaved() {
         val recorder = show(LibraryState(albums = listOf(album), initialized = true))
 
-        compose.onNodeWithText("定时").performClick()
+        compose.onNodeWithTag("nav-playback").performClick()
+        compose.onNodeWithText("定时计划").performClick()
         compose.onNodeWithContentDescription("新建播放计划").performClick()
         listOf("一", "二", "三", "四", "五", "六", "日").forEach { day ->
             compose.onNodeWithText(day).performScrollTo().performClick()
@@ -187,6 +302,15 @@ class LibraryScreenTest {
                 state.value = state.value.copy(preferences = preferences)
             },
             onMessage = { recorder.calls += "message:$it" },
+            onReanalyzePhoto = { recorder.calls += "reanalyze:${it.sourceId}:${it.id}" },
+            onRemovePhoto = { photo ->
+                recorder.calls += "remove:${photo.sourceId}:${photo.id}"
+                state.value = state.value.copy(photos = state.value.photos.map { if (it.id == photo.id && it.sourceId == photo.sourceId) it.copy(trashedAt = 1, unavailableReason = com.muguang.album.core.USER_REMOVED_PHOTO) else it })
+            },
+            onRestorePhoto = { photo ->
+                recorder.calls += "restore:${photo.sourceId}:${photo.id}"
+                state.value = state.value.copy(photos = state.value.photos.map { if (it.id == photo.id && it.sourceId == photo.sourceId) it.copy(trashedAt = null, unavailableReason = null) else it })
+            },
         )
         compose.setContent {
             MuguangTheme(dynamicColor = false) {

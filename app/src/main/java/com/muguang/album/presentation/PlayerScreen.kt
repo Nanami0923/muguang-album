@@ -65,6 +65,8 @@ fun PlayerScreen(
     onMusicPrevious: () -> Unit, onMusicNext: () -> Unit, onMusicVolume: (Float) -> Unit,
     onSavePhoto: (Photo, FocusPoint?, PhotoCategory?, MotionMode?) -> Unit = { _, _, _, _ -> },
     onFrame: (Long) -> Unit = {},
+    onPresentation: (Photo, String?) -> Unit = { _, _ -> },
+    onAiRecognize: (String) -> Unit = {},
 ) {
     var editing by rememberSaveable { mutableStateOf(false) }
     var resumeAfterEdit by rememberSaveable { mutableStateOf(false) }
@@ -104,7 +106,7 @@ fun PlayerScreen(
                 Icon(Icons.Rounded.NightsStay, null, tint = Color(0xFF8C849A), modifier = Modifier.size(40.dp))
                 Text(now.atZone(ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("HH:mm")), fontSize = 72.sp, color = Color(0xFFB0A9BB), fontWeight = FontWeight.Light)
                 Text("等待下个播放时段", style = MaterialTheme.typography.headlineSmall, color = Color(0xFFB0A9BB))
-                Text(if (next != null) "下次开始  ${next.start.atZone(ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("M月d日 HH:mm"))}" else "还没有启用的计划，可返回定时页添加", color = Color(0xFF8C849A), textAlign = TextAlign.Center)
+                Text(if (next != null) "下次开始  ${next.start.atZone(ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("M月d日 HH:mm"))}" else "还没有启用的计划，可返回播放设置的定时计划添加", color = Color(0xFF8C849A), textAlign = TextAlign.Center)
                 Text(if (library.preferences.keepStandbyAwake) "常驻展示 · 屏幕仍保持开启 · 配乐已停止" else "省电等待 · 允许系统正常熄屏", style = MaterialTheme.typography.bodySmall, color = Color(0xFF756F80), textAlign = TextAlign.Center)
                 OutlinedButton(onClick = onExit) { Text("返回相册") }
             }
@@ -147,7 +149,7 @@ fun PlayerScreen(
     }
     if (editing && session != null) {
         fun closeEditor() { editing = false; if (resumeAfterEdit && session.paused) onPause(); resumeAfterEdit = false }
-        FocusEditor(session.photo, session.album, ::closeEditor) { point, category, motion ->
+        FocusEditor(session.photo, session.album, ::closeEditor, onPresentation={onPresentation(session.photo,it)}, onAiRecognize={onAiRecognize(session.photo.id)}) { point, category, motion ->
             onSavePhoto(session.photo, point, category, motion); closeEditor()
         }
     }
@@ -174,14 +176,45 @@ fun PlayerScreen(
     )
 }
 
+private class LoadedSlide(val painter: Painter, val session: PlayerSession) {
+    var focusProgress = 0f
+    var focusCycle = session.motionCycle
+}
+
 @Composable
 private fun PhotoCanvas(session: PlayerSession, onReady: (Long, String) -> Unit, onError: (Long, String) -> Unit, onFrame: (Long) -> Unit) {
-    var stable by remember { mutableStateOf<Painter?>(null) }
-    var previous by remember { mutableStateOf<Painter?>(null) }
-    val alpha = remember { Animatable(1f) }
-    val scope = rememberCoroutineScope()
-    LaunchedEffect(session.token) { alpha.snapTo(1f); previous = null }
-    val scale = if (session.album.scale == PhotoScale.CROP) ContentScale.Crop else ContentScale.Fit
+    var loaded by remember { mutableStateOf<LoadedSlide?>(null) }
+    var current by remember { mutableStateOf<LoadedSlide?>(null) }
+    var previous by remember { mutableStateOf<LoadedSlide?>(null) }
+    var progress by remember { mutableFloatStateOf(1f) }
+    var effect by remember { mutableStateOf(SlideEffect.FADE) }
+    var transitioning by remember { mutableStateOf(false) }
+    val cycle = remember { com.muguang.album.playback.SlideEffectCycle() }
+    val latestOnFrame by rememberUpdatedState(onFrame)
+    LaunchedEffect(session.token, loaded, session.paused) {
+        val next = loaded
+        if (next == null || next.session.token != session.token) {
+            previous = null; progress = 1f; transitioning = false
+            return@LaunchedEffect
+        }
+        if (current !== next) {
+            previous = current
+            effect = cycle.next(session.album.transitionEffect)
+            progress = if (previous == null || session.album.effectiveTransitionMillis == 0) 1f else 0f
+            current = next
+            transitioning = progress < 1f
+        }
+        if (session.paused) return@LaunchedEffect
+        var last = withFrameNanos { it }
+        while (progress < 1f) {
+            withFrameNanos { now ->
+                latestOnFrame((now - last) / 1_000_000)
+                progress = (progress + (now - last) / (session.album.effectiveTransitionMillis.coerceAtLeast(1) * 1_000_000f)).coerceAtMost(1f)
+                last = now
+            }
+        }
+        previous = null; transitioning = false
+    }
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val density = LocalDensity.current
         val context = LocalContext.current
@@ -190,25 +223,40 @@ private fun PhotoCanvas(session: PlayerSession, onReady: (Long, String) -> Unit,
         val height = with(density) { maxHeight.roundToPx() }.coerceAtLeast(1)
         val cap = if (memory <= 128) 1920 else 3072
         val factor = (cap.toFloat() / maxOf(width, height)).coerceAtMost(1f)
-        previous?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = scale) }
-        stable?.let { painter ->
-            val mode = session.photo.metadata.customMotionMode ?: session.album.motionMode.name
-            if (mode == MotionMode.OFF.name) Image(painter, session.photo.name, Modifier.fillMaxSize().alpha(alpha.value), contentScale = scale)
-            else MotionPicture(painter, session.photo, session.album, session.paused || !session.ready, session.token to session.motionCycle, Modifier.alpha(alpha.value), onFrame)
-        }
-        if (stable == null) CircularProgressIndicator(Modifier.align(Alignment.Center))
+        val old = previous
+        val active = current
+        if (active != null) SlideTransition(effect, if (old == null) 1f else progress,
+            previous = old?.let { frame -> { modifier ->
+                key(frame.session.token) { SlidePicture(frame, frame.session.copy(motionCycle = frame.focusCycle), true, modifier) {} }
+            } },
+            current = { modifier ->
+                key(active.session.token) {
+                    val live = if (active.session.token == session.token) session else active.session
+                    SlidePicture(active, live, session.paused || !session.ready || transitioning || active.session.token != session.token,
+                        modifier, onFrame)
+                }
+            })
+        else CircularProgressIndicator(Modifier.align(Alignment.Center))
         key(session.token, session.photo.uri, session.photo.modifiedAt, session.photo.fileSize) {
             LoadPhoto(session.photo.uri, (width * factor).toInt(), (height * factor).toInt(), onLoaded = { painter ->
-                previous = stable
-                stable = painter
+                loaded = LoadedSlide(painter, session)
                 onReady(session.token, session.photo.id)
-                scope.launch {
-                    alpha.snapTo(if (previous == null) 1f else 0f)
-                    alpha.animateTo(1f, tween(session.album.transitionMillis.coerceAtMost(session.album.intervalSeconds * 500)))
-                    previous = null
-                }
             }, onError = { onError(session.token, session.photo.id) })
         }
+    }
+}
+
+@Composable
+private fun SlidePicture(frame: LoadedSlide, session: PlayerSession, paused: Boolean, modifier: Modifier, onFrame: (Long) -> Unit) {
+    if (frame.focusCycle != session.motionCycle) { frame.focusCycle = session.motionCycle; frame.focusProgress = 0f }
+    val photo = session.photo
+    val mode = photo.metadata.customMotionMode ?: session.album.motionMode.name
+    when {
+        photo.metadata.wholeView -> Image(frame.painter, photo.name, modifier.background(Color(0xFF08090B)), contentScale = ContentScale.Fit)
+        mode == MotionMode.OFF.name -> Image(frame.painter, photo.name, modifier.background(Color(0xFF08090B)),
+            contentScale = if (session.album.scale == PhotoScale.CROP) ContentScale.Crop else ContentScale.Fit)
+        else -> MotionPicture(frame.painter, photo, session.album, paused, session.token to session.motionCycle,
+            modifier, onFrame, frame.focusProgress) { frame.focusProgress = it }
     }
 }
 

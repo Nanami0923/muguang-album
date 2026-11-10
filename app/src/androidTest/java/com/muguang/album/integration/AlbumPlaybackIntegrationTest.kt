@@ -231,6 +231,76 @@ class AlbumPlaybackIntegrationTest {
         assertFalse(model.music.state.value.isPlaying)
     }
 
+    @Test fun photoReanalysisRemovalAndRestorePreserveOriginalAndOtherAlbums() {
+        assumeTrue("Run photo action verification in the isolated test app", instrumentation.targetContext.packageName.endsWith(".smarttest"))
+        assertFalse("Device tests must not issue paid API calls", model.library.value.ai.enabled)
+        val album = createFixtureAlbum(intervalSeconds = 30)
+        val otherAlbum = createFixtureAlbum(intervalSeconds = 30)
+        val photo = model.library.value.photosFor(album.id).first()
+        val before = instrumentation.targetContext.contentResolver.openInputStream(android.net.Uri.parse(photo.uri))!!.use { it.readBytes() }
+        onMain { model.setForeground(false) }
+        runBlocking {
+            model.repository.savePhotoEdits(photo.sourceId, photo.id, com.muguang.album.core.FocusPoint(.8f, .2f), com.muguang.album.core.PhotoCategory.ART, null)
+            model.repository.reanalyzePhoto(photo.sourceId, photo.id)
+        }
+        await("single photo queued") { model.library.value.photos.find { it.sourceId == photo.sourceId && it.id == photo.id }?.metadata?.classificationStatus == "REANALYZE" }
+        onMain { model.setForeground(true) }
+        await("actual models finish reanalysis", 90_000) {
+            model.library.value.photos.find { it.sourceId == photo.sourceId && it.id == photo.id }?.metadata?.taskState == "DONE"
+        }
+        val result = model.library.value.photos.single { it.sourceId == photo.sourceId && it.id == photo.id }.metadata
+        assertEquals(.8f, result.manualX)
+        assertEquals("ART", result.manualCategory)
+        assertEquals(64, result.fingerprint.length)
+        assertEquals(com.muguang.album.analysis.OfflinePhotoAnalyzer.VERSION, result.modelVersion)
+        runBlocking { model.repository.removePhoto(photo.sourceId, photo.id) }
+        await("removed only from current album") { model.library.value.photosFor(album.id).size == 2 }
+        assertEquals(3, model.library.value.photosFor(otherAlbum.id).size)
+        runBlocking { model.repository.scan(photo.sourceId) }
+        await("refresh keeps manual removal") { model.library.value.photos.find { it.sourceId == photo.sourceId && it.id == photo.id }?.unavailableReason == com.muguang.album.core.USER_REMOVED_PHOTO }
+        assertEquals(2, model.library.value.photosFor(album.id).size)
+        assertArrayEquals(before, instrumentation.targetContext.contentResolver.openInputStream(android.net.Uri.parse(photo.uri))!!.use { it.readBytes() })
+        runBlocking { model.repository.restorePhoto(photo.sourceId, photo.id) }
+        await("restored from trash") { model.library.value.photosFor(album.id).size == 3 }
+        assertEquals("ART", model.library.value.photosFor(album.id).first { it.id == photo.id }.metadata.manualCategory)
+    }
+
+    @Test fun everyTransitionAndFocusZoomWorkWithRealImagesPauseAndRapidNavigation() {
+        assumeTrue(instrumentation.targetContext.packageName.endsWith(".smarttest"))
+        val original = createFixtureAlbum(intervalSeconds = 30)
+        runBlocking {
+            model.library.value.photosFor(original.id).forEach { photo ->
+                model.repository.savePhotoEdits(photo.sourceId, photo.id, com.muguang.album.core.FocusPoint(.75f, .25f), null, null)
+            }
+        }
+        val effects = com.muguang.album.core.SlideEffect.entries.filter { it != com.muguang.album.core.SlideEffect.NONE }
+        for (effect in effects) {
+            onMain { model.stopPlayback(leaveDisplay = true) }
+            val configured = original.copy(transitionEffect = effect, transitionMillis = 350,
+                motionMode = com.muguang.album.core.MotionMode.FIT_ZOOM, focusDurationSeconds = 1)
+            runBlocking { model.repository.updateAlbum(configured) }
+            await("saved animation settings") { model.library.value.albums.find { it.id == original.id } == configured }
+            onMain { model.playAlbum(original.id) }
+            await("first frame for $effect") { model.session.value?.ready == true }
+            onMain { model.changePhoto(1) }
+            await("animated frame for $effect") { model.session.value?.let { it.index == 1 && it.ready } == true }
+            holdFor(450)
+            onMain { model.togglePause() }
+            assertTrue(model.session.value!!.paused)
+            onMain { model.changePhoto(1) }
+            await("paused frame for $effect") { model.session.value?.let { it.index == 2 && it.ready } == true }
+            assertTrue(model.session.value!!.paused)
+            holdFor(150)
+            onMain { model.togglePause() }
+            holdFor(600)
+            onMain { model.changePhoto(1); model.changePhoto(1); model.changePhoto(-1) }
+            val expected = model.session.value!!
+            await("rapid navigation settles for $effect") { model.session.value?.let { it.token == expected.token && it.ready } == true }
+            holdFor(400)
+            assertEquals(expected.photo.id, model.session.value!!.photo.id)
+        }
+    }
+
     private fun createFixtureAlbum(intervalSeconds: Int, loop: Boolean = true): Album {
         val id = runBlocking { withTimeout(15_000) { model.repository.createAlbum("合成素材测试-${UUID.randomUUID().toString().take(6)}") } }
         createdAlbums += id

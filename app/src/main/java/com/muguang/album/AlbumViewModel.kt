@@ -100,10 +100,26 @@ class AlbumViewModel(application: Application) : AndroidViewModel(application) {
     }
     fun scanSource(id: String) = launchOperation { repository.scan(id) }
     fun analysisCommand(id: String, command: String) = launchOperation { repository.setAnalysisState(id, command) }
+    fun saveAiSettings(settings: AiSettings, key: String?) = launchOperation { repository.saveAiSettings(settings,key); message("AI 配置已保存") }
+    fun aiCommand(command: String, photoId: String?) = launchOperation { repository.aiCommand(command,photoId) }
+    fun testAiConnection() = launchOperation { message(repository.testAiConnection()) }
+    fun setPhotoPresentation(photo:Photo,presentation:String?) = launchOperation { repository.setPhotoPresentation(photo.sourceId,photo.id,presentation) }
     fun savePhoto(photo: Photo, point: FocusPoint?, category: PhotoCategory?, motion: MotionMode?) = launchOperation {
         repository.savePhotoEdits(photo.sourceId, photo.id, point, category, motion)
     }
     fun removeSource(id: String) = launchOperation { repository.removeSource(id) }
+    fun reanalyzePhoto(photo: Photo) = launchOperation {
+        repository.reanalyzePhoto(photo.sourceId, photo.id)
+        message("已加入重新识别队列，手动调整会保留")
+    }
+    fun removePhoto(photo: Photo) = launchOperation {
+        repository.removePhoto(photo.sourceId, photo.id)
+        message("已从当前相册移除，原图保留，可在回收站恢复")
+    }
+    fun restorePhoto(photo: Photo) = launchOperation {
+        repository.restorePhoto(photo.sourceId, photo.id)
+        message("图片已恢复到相册")
+    }
     fun updateSource(id: String, recursive: Boolean) = launchOperation {
         repository.updateSource(id, recursive)
     }
@@ -164,7 +180,7 @@ class AlbumViewModel(application: Application) : AndroidViewModel(application) {
         val current = _session.value ?: return
         if (current.token != token || current.photo.id != photoId || current.ready) return
         _session.value = current.copy(ready = true)
-        if (!current.paused) dwellDeadline = SystemClock.elapsedRealtime() + dwellRemaining + current.album.transitionMillis
+        if (!current.paused) dwellDeadline = SystemClock.elapsedRealtime() + dwellRemaining + current.album.effectiveTransitionMillis
     }
 
     fun imageFailed(token: Long, photoId: String) {

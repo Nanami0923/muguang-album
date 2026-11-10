@@ -6,6 +6,7 @@ import android.app.TimePickerDialog
 import android.os.Build
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
@@ -18,6 +19,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
@@ -35,6 +37,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -66,11 +69,20 @@ data class LibraryActions(
     val onMessage: (String) -> Unit,
     val onSavePhoto: (Photo, FocusPoint?, PhotoCategory?, MotionMode?) -> Unit = { _, _, _, _ -> },
     val onAnalysisCommand: (String, String) -> Unit = { _, _ -> },
+    val onSaveAi: (AiSettings, String?) -> Unit = { _, _ -> },
+    val onAiCommand: (String, String?) -> Unit = { _, _ -> },
+    val onTestAi: () -> Unit = {},
+    val onPresentation: (Photo, String?) -> Unit = { _, _ -> },
+    val onReanalyzePhoto: (Photo) -> Unit = {},
+    val onRemovePhoto: (Photo) -> Unit = {},
+    val onRestorePhoto: (Photo) -> Unit = {},
 )
 
 private enum class Destination(val title: String, val icon: ImageVector) {
     ALBUMS("相册", Icons.Outlined.PhotoLibrary),
-    SCHEDULE("定时", Icons.Outlined.Schedule),
+    AI("AI", Icons.Outlined.AutoAwesome),
+    PLAY("播放", Icons.Outlined.PlayArrow),
+    PLAYBACK("播放设置", Icons.Outlined.Slideshow),
     SETTINGS("设置", Icons.Outlined.Tune),
 }
 
@@ -81,53 +93,80 @@ fun MainLibraryScreen(library: LibraryState, selectedAlbumId: String?, actions: 
     Surface(color = MaterialTheme.colorScheme.background) {
         BoxWithConstraints(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
             val wide = maxWidth >= 840.dp
-            Row(Modifier.fillMaxSize()) {
-                if (wide) {
-                    NavigationRail(
-                        containerColor = MaterialTheme.colorScheme.background,
-                        modifier = Modifier.fillMaxHeight().width(100.dp).padding(top = 20.dp),
-                        header = {
-                            Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.primaryContainer) {
-                                Icon(Icons.Outlined.FilterVintage, "暮光相册", Modifier.padding(14.dp).size(28.dp), tint = MaterialTheme.colorScheme.primary)
-                            }
-                            Spacer(Modifier.height(48.dp))
-                        },
-                    ) {
-                        Destination.entries.forEach { item ->
-                            NavigationRailItem(
-                                selected = destination == item,
-                                onClick = { destination = item },
-                                icon = { Icon(item.icon, null) },
-                                label = { Text(item.title) },
-                                modifier = Modifier.padding(bottom = 16.dp),
-                            )
-                        }
+            Column(Modifier.fillMaxSize()) {
+                Box(Modifier.weight(1f).fillMaxWidth()) {
+                    if (!library.initialized) CircularProgressIndicator(Modifier.align(Alignment.Center))
+                    else when (destination) {
+                        Destination.ALBUMS -> AlbumPage(library, selected, actions, wide)
+                        Destination.AI -> AiPage(library, actions)
+                        Destination.PLAYBACK -> PlaybackPage(library, selected, actions)
+                        Destination.SETTINGS -> SettingsPage(library, actions)
+                        Destination.PLAY -> Unit // The center action never changes the current destination.
                     }
                 }
-                Column(Modifier.weight(1f).fillMaxHeight()) {
-                    Box(Modifier.weight(1f).fillMaxWidth()) {
-                        if (!library.initialized) {
-                            CircularProgressIndicator(Modifier.align(Alignment.Center))
-                        } else when (destination) {
-                            Destination.ALBUMS -> AlbumPage(library, selected, actions, wide)
-                            Destination.SCHEDULE -> SchedulePage(library, actions)
-                            Destination.SETTINGS -> SettingsPage(library, actions)
-                        }
-                    }
-                    if (!wide) {
-                        NavigationBar(containerColor = MaterialTheme.colorScheme.surfaceContainerLow) {
-                            Destination.entries.forEach { item ->
-                                NavigationBarItem(
-                                    selected = destination == item,
-                                    onClick = { destination = item },
-                                    icon = { Icon(item.icon, null) },
-                                    label = { Text(item.title) },
-                                )
+                NavigationBar(containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
+                    modifier = Modifier.testTag("main-navigation")) {
+                    Destination.entries.forEach { item ->
+                        if (item == Destination.PLAY) {
+                            Box(Modifier.weight(1f).height(80.dp), contentAlignment = Alignment.Center) {
+                                FilledIconButton(onClick = {
+                                    when {
+                                        selected == null -> actions.onMessage("请先创建一本相册")
+                                        library.playbackPhotosFor(selected).isEmpty() -> actions.onMessage("当前相册没有可播放的照片，请添加图片或调整播放类别")
+                                        else -> actions.onPlay(selected.id)
+                                    }
+                                }, enabled = library.initialized,
+                                    modifier = Modifier.size(60.dp).offset(y = (-6).dp).testTag("start-slideshow"),
+                                    shape = RoundedCornerShape(20.dp)) {
+                                    Icon(Icons.Outlined.PlayArrow, "启动幻灯片", Modifier.size(38.dp))
+                                }
                             }
-                        }
+                        } else NavigationBarItem(
+                            selected = destination == item,
+                            onClick = { destination = item },
+                            icon = { Icon(item.icon, null) },
+                            label = { Text(item.title, maxLines = 1, softWrap = false) },
+                            modifier = Modifier.testTag("nav-${item.name.lowercase()}"),
+                        )
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun AiPage(library: LibraryState, actions: LibraryActions) {
+    LazyColumn(Modifier.fillMaxSize().padding(horizontal = 24.dp).testTag("ai-page"),
+        contentPadding = PaddingValues(top = 28.dp, bottom = 32.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
+        item { PageHeading("AI 图片识别", "管理视觉服务与图片识别队列。") }
+        item { SettingsSection("AI 配置与任务", Icons.Outlined.AutoAwesome) {
+            AiSettingsPanel(library.ai, library.photos, actions.onSaveAi, actions.onAiCommand, actions.onTestAi)
+        } }
+    }
+}
+
+@Composable
+private fun PlaybackPage(library: LibraryState, album: Album?, actions: LibraryActions) {
+    var schedule by rememberSaveable { mutableStateOf(false) }
+    Column(Modifier.fillMaxSize()) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            FilterChip(!schedule, { schedule = false }, label = { Text("播放参数") })
+            FilterChip(schedule, { schedule = true }, label = { Text("定时计划") })
+        }
+        if (schedule) SchedulePage(library, actions)
+        else LazyColumn(Modifier.fillMaxSize().padding(horizontal = 24.dp).testTag("playback-settings-list"),
+            contentPadding = PaddingValues(top = 12.dp, bottom = 32.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
+            item { PageHeading("播放设置", "为当前相册调整画面与节奏。") }
+            item { LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(library.albums, key = { it.id }) { item ->
+                    FilterChip(album?.id == item.id, { actions.onSelectAlbum(item.id) }, label = { Text(item.name) })
+                }
+            } }
+            if (album == null) item { Text("请先在相册页创建一本相册。") }
+            else item { SettingsSection("${album.name} · 播放参数", Icons.Outlined.Slideshow) {
+                AlbumPlaybackEditor(album, onSave = { actions.onUpdateAlbum(it); actions.onMessage("播放设置已保存") })
+            } }
         }
     }
 }
@@ -147,15 +186,19 @@ private fun PageHeading(title: String, subtitle: String, trailing: @Composable R
 @Composable
 private fun AlbumPage(library: LibraryState, album: Album?, actions: LibraryActions, wide: Boolean) {
     var createDialog by rememberSaveable { mutableStateOf(false) }
-    var settingsDialog by rememberSaveable { mutableStateOf(false) }
     var musicDialog by rememberSaveable { mutableStateOf(false) }
     var sourceDialog by rememberSaveable { mutableStateOf(false) }
     var deleteDialog by rememberSaveable { mutableStateOf(false) }
     var previewId by rememberSaveable { mutableStateOf<String?>(null) }
     var previewSourceId by rememberSaveable { mutableStateOf<String?>(null) }
+    var actionPhotoId by rememberSaveable(album?.id) { mutableStateOf<String?>(null) }
+    var actionSourceId by rememberSaveable(album?.id) { mutableStateOf<String?>(null) }
+    var confirmPhotoRemoval by rememberSaveable(album?.id) { mutableStateOf(false) }
+    val actionPhoto = library.photos.find { it.id == actionPhotoId && it.sourceId == actionSourceId && it.trashedAt == null }
     val preview = library.photos.find { it.id == previewId && it.sourceId == previewSourceId }
     var categoryFilter by remember { mutableStateOf<PhotoCategory?>(null) }
     var issueFilter by remember { mutableStateOf("全部") }
+    var peopleFilter by remember { mutableStateOf<String?>(null) }
     var trashDialog by remember { mutableStateOf(false) }
     val photos = remember(library.photos, library.sources, album?.id, album?.sortOrder) {
         album?.let { item ->
@@ -165,9 +208,12 @@ private fun AlbumPage(library: LibraryState, album: Album?, actions: LibraryActi
         } ?: emptyList()
     }
     val sources = library.sources.filter { it.albumId == album?.id && it.kind == SourceKind.PHOTO }
-    val visiblePhotos = photos.filter { (categoryFilter == null || it.metadata.category == categoryFilter) && when (issueFilter) {
-        "待手动选点" -> it.metadata.manualFocus == null && it.metadata.focusStatus == "NEEDS_MANUAL"
+    val visiblePhotos = photos.filter { (categoryFilter == null || categoryFilter!!.includes(it.metadata.category)) && (peopleFilter==null || it.metadata.people==peopleFilter) && when (issueFilter) {
+        "待手动选点" -> it.metadata.manualFocus == null && !it.metadata.wholeView && it.metadata.focusStatus == "NEEDS_MANUAL"
         "技术错误" -> it.metadata.taskState == "FAILED"
+        "待 AI" -> it.metadata.aiStatus in setOf("QUEUED","WAITING_CONFIG","PROCESSING")
+        "AI 调用失败" -> it.metadata.aiStatus in setOf("FAILED","UNKNOWN_OUTCOME")
+        "整体展示" -> it.metadata.wholeView
         else -> true
     } }
     val scanning = sources.any { it.id in library.scanningSourceIds }
@@ -209,7 +255,7 @@ private fun AlbumPage(library: LibraryState, album: Album?, actions: LibraryActi
                             }
                         }
                         item(key = "summary", span = { GridItemSpan(maxLineSpan) }) {
-                            AlbumSummary(album, photos, sources.size, scanning, onPlay = { actions.onPlay(album.id) }, onSettings = { settingsDialog = true })
+                            AlbumSummary(album, photos, sources.size, scanning) { deleteDialog = true }
                         }
                         item(key = "photo-actions", span = { GridItemSpan(maxLineSpan) }) {
                             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -232,7 +278,7 @@ private fun AlbumPage(library: LibraryState, album: Album?, actions: LibraryActi
                                             label = { Text(label) }, modifier = Modifier.testTag("gallery-columns-$count"))
                                     }
                                 }
-                                LibraryFilterBar(categoryFilter, { categoryFilter = it }, issueFilter, { issueFilter = it }, { trashDialog = true })
+                                LibraryFilterBar(categoryFilter, { categoryFilter = it }, issueFilter, { issueFilter = it }, { trashDialog = true },peopleFilter,{peopleFilter=it})
                             }
                         }
                         if (visiblePhotos.isEmpty()) {
@@ -249,7 +295,13 @@ private fun AlbumPage(library: LibraryState, album: Album?, actions: LibraryActi
                                 }
                             }
                         } else {
-                            items(visiblePhotos, key = { "photo:${it.id}" }) { photo -> PhotoTile(photo) { previewId = photo.id; previewSourceId = photo.sourceId } }
+                            items(visiblePhotos, key = { "photo:${it.id}" }) { photo ->
+                                PhotoTile(photo, onLongClick = {
+                                    actionPhotoId = photo.id
+                                    actionSourceId = photo.sourceId
+                                    confirmPhotoRemoval = false
+                                }) { previewId = photo.id; previewSourceId = photo.sourceId }
+                            }
                         }
                     }
                 }
@@ -260,18 +312,10 @@ private fun AlbumPage(library: LibraryState, album: Album?, actions: LibraryActi
                             sources.forEach { source -> SourceRow(source, library, actions) }
                         }
                         MusicSummary(library, album, onOpen = { musicDialog = true })
-                        SidePanel("播放设置", Icons.Outlined.Tune, action = { settingsDialog = true }) {
-                            InfoRow("换片间隔", "${album.intervalSeconds} 秒")
-                            InfoRow("图片顺序", if (album.shuffle) "随机播放" else "顺序播放")
-                            InfoRow("显示方式", if (album.scale == PhotoScale.FIT) "完整显示" else "填满画面")
-                            InfoRow("循环播放", if (album.loop) "已开启" else "已关闭")
-                        }
-                        TextButton(onClick = { deleteDialog = true }) { Icon(Icons.Outlined.DeleteOutline, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("移除此相册") }
                         Spacer(Modifier.height(16.dp))
                     }
                 }
             }
-            if (settingsDialog) AlbumSettingsDialog(album, onDismiss = { settingsDialog = false }, onSave = actions.onUpdateAlbum, onDelete = { settingsDialog = false; deleteDialog = true })
             if (musicDialog) MusicSettingsDialog(library, album, actions) { musicDialog = false }
             if (sourceDialog) ContentDialog("图片文件夹", { sourceDialog = false }) {
                 sources.forEach { SourceRow(it, library, actions) }
@@ -283,9 +327,35 @@ private fun AlbumPage(library: LibraryState, album: Album?, actions: LibraryActi
             }
             preview?.let { original ->
                 val photo = library.photos.find { it.id == original.id && it.sourceId == original.sourceId } ?: original
-                FocusEditor(photo, album, onDismiss = { previewId = null }) { point, category, motion -> actions.onSavePhoto(photo, point, category, motion); previewId = null }
+                FocusEditor(photo, album, onDismiss = { previewId = null }, onPresentation = { actions.onPresentation(photo,it) }, onAiRecognize = { actions.onAiCommand("REANALYZE",photo.id) }) { point, category, motion -> actions.onSavePhoto(photo, point, category, motion); previewId = null }
             }
-            if (trashDialog) TrashDialog(library.photos.filter { p -> p.trashedAt != null && sources.any { it.id == p.sourceId } }, { trashDialog = false }) { actions.onRefreshSource(it) }
+            actionPhoto?.let { photo ->
+                if (confirmPhotoRemoval) AlertDialog(
+                    onDismissRequest = { confirmPhotoRemoval = false; actionPhotoId = null },
+                    title = { Text("从当前相册删除？") },
+                    text = { Text("“${photo.name}”将从当前相册移除，手机原图会保留，其他相册不受影响。可在回收站恢复。") },
+                    confirmButton = { TextButton(onClick = { actions.onRemovePhoto(photo); actionPhotoId = null; confirmPhotoRemoval = false }, modifier = Modifier.testTag("confirm-remove-photo")) { Text("确认移除") } },
+                    dismissButton = { TextButton(onClick = { actionPhotoId = null; confirmPhotoRemoval = false }) { Text("取消") } },
+                ) else AlertDialog(
+                    onDismissRequest = { actionPhotoId = null },
+                    title = { Text("图片操作") },
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            Text(photo.name, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            FilledTonalButton(onClick = { actions.onReanalyzePhoto(photo); actionPhotoId = null }, modifier = Modifier.fillMaxWidth().testTag("photo-action-reanalyze")) {
+                                Icon(Icons.Outlined.Refresh, null); Spacer(Modifier.width(8.dp)); Text("重新识别")
+                            }
+                            OutlinedButton(onClick = { confirmPhotoRemoval = true }, modifier = Modifier.fillMaxWidth().testTag("photo-action-remove")) {
+                                Icon(Icons.Outlined.DeleteOutline, null); Spacer(Modifier.width(8.dp)); Text("删除")
+                            }
+                            Text("仅从当前相册移除，保留原图。", style = MaterialTheme.typography.bodySmall)
+                            Text("重新运行本地识别，保留手动调整。" + if (library.ai.enabled) "有争议时按 AI 设置处理，可能产生费用。" else "AI 未启用时不会发起 API 请求。", style = MaterialTheme.typography.bodySmall)
+                        }
+                    },
+                    confirmButton = { TextButton(onClick = { actionPhotoId = null }) { Text("取消") } },
+                )
+            }
+            if (trashDialog) TrashDialog(library.photos.filter { p -> p.trashedAt != null && sources.any { it.id == p.sourceId } }, { trashDialog = false }, onRestore = actions.onRestorePhoto) { actions.onRefreshSource(it) }
         }
     }
     if (createDialog) {
@@ -302,7 +372,7 @@ private fun AlbumPage(library: LibraryState, album: Album?, actions: LibraryActi
 }
 
 @Composable
-private fun AlbumSummary(album: Album, photos: List<Photo>, sourceCount: Int, scanning: Boolean, onPlay: () -> Unit, onSettings: () -> Unit) {
+private fun AlbumSummary(album: Album, photos: List<Photo>, sourceCount: Int, scanning: Boolean, onDelete: () -> Unit) {
     Surface(shape = RoundedCornerShape(24.dp), color = MaterialTheme.colorScheme.surfaceContainerLow) {
         Row(Modifier.fillMaxWidth().padding(20.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
             if (photos.isNotEmpty()) {
@@ -316,27 +386,26 @@ private fun AlbumSummary(album: Album, photos: List<Photo>, sourceCount: Int, sc
                 Text(album.name, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Medium, maxLines = 2, overflow = TextOverflow.Ellipsis)
                 Spacer(Modifier.height(6.dp))
                 Text(if (scanning) "正在扫描文件夹…" else "${photos.size} 张照片 · $sourceCount 个文件夹", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Spacer(Modifier.height(12.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    FilledTonalButton(onClick = onPlay, enabled = photos.isNotEmpty(), contentPadding = PaddingValues(horizontal = 16.dp)) {
-                        Icon(Icons.Outlined.PlayArrow, null, Modifier.size(20.dp)); Spacer(Modifier.width(4.dp)); Text("开始播放")
-                    }
-                    IconButton(onClick = onSettings) { Icon(Icons.Outlined.Tune, "播放设置") }
-                }
+
             }
+            IconButton(onClick = onDelete) { Icon(Icons.Outlined.DeleteOutline, "移除此相册") }
         }
     }
 }
 
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-private fun PhotoTile(photo: Photo, onClick: () -> Unit) {
-    Box(Modifier.fillMaxWidth().aspectRatio(1f).testTag("photo-tile-${photo.id}").clip(RoundedCornerShape(16.dp)).background(MaterialTheme.colorScheme.surfaceContainer).clickable(onClick = onClick)) {
+private fun PhotoTile(photo: Photo, onLongClick: () -> Unit, onClick: () -> Unit) {
+    Box(Modifier.fillMaxWidth().aspectRatio(1f).testTag("photo-tile-${photo.id}").clip(RoundedCornerShape(16.dp)).background(MaterialTheme.colorScheme.surfaceContainer).combinedClickable(onClick = onClick, onLongClickLabel = "图片操作", onLongClick = onLongClick)) {
         AsyncImage(photo.uri, photo.name, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
         Surface(Modifier.align(Alignment.TopEnd).padding(6.dp), color = Color.Black.copy(alpha = .65f), shape = RoundedCornerShape(6.dp)) {
             Text(photo.metadata.displayStatus, Modifier.padding(4.dp), color = Color.White, style = MaterialTheme.typography.labelSmall)
         }
         Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(50.dp).background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = .52f)))))
-        Text(photo.name, Modifier.align(Alignment.BottomStart).padding(10.dp), style = MaterialTheme.typography.labelSmall, color = Color.White, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Column(Modifier.align(Alignment.BottomStart).padding(10.dp)) {
+            Text(photo.metadata.categoryLabel,style=MaterialTheme.typography.labelSmall,color=Color.White,maxLines=1,overflow=TextOverflow.Ellipsis)
+            Text(photo.name,style=MaterialTheme.typography.labelSmall,color=Color.White.copy(alpha=.75f),maxLines=1,overflow=TextOverflow.Ellipsis)
+        }
     }
 }
 
@@ -438,10 +507,11 @@ private fun ContentDialog(title: String, onDismiss: () -> Unit, content: @Compos
 }
 
 @Composable
-private fun AlbumSettingsDialog(album: Album, onDismiss: () -> Unit, onSave: (Album) -> Unit, onDelete: () -> Unit) {
+private fun AlbumPlaybackEditor(album: Album, onSave: (Album) -> Unit) {
     var draft by remember(album) { mutableStateOf(album) }
     var interval by remember(album) { mutableStateOf(album.intervalSeconds.toString()) }
-    ContentDialog("播放设置", onDismiss) {
+    var focusDurationValid by remember(album) { mutableStateOf(true) }
+    Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
         OutlinedTextField(draft.name, { draft = draft.copy(name = it) }, label = { Text("相册名称") }, singleLine = true, modifier = Modifier.fillMaxWidth())
         Text("每张照片停留", style = MaterialTheme.typography.titleSmall)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -460,14 +530,61 @@ private fun AlbumSettingsDialog(album: Album, onDismiss: () -> Unit, onSave: (Al
             FilterChip(draft.scale == PhotoScale.FIT, { draft = draft.copy(scale = PhotoScale.FIT) }, label = { Text("完整显示") })
             FilterChip(draft.scale == PhotoScale.CROP, { draft = draft.copy(scale = PhotoScale.CROP) }, label = { Text("填满裁切") })
         }
-        ToggleRow("淡入淡出", "关闭后直接切换，更适合较旧的平板", draft.transitionMillis > 0, { draft = draft.copy(transitionMillis = if (it) 500 else 0) })
+        AnimationSettings(draft, { focusDurationValid = it }) { draft = it }
         SmartPlaybackSettings(draft) { draft = it }
         Button(onClick = {
             val seconds = interval.toIntOrNull()
-            if (seconds != null && seconds in 1..3600 && draft.name.isNotBlank()) { onSave(draft.copy(intervalSeconds = seconds, name = draft.name.trim())); onDismiss() }
-        }, enabled = interval.toIntOrNull() in 1..3600 && draft.name.isNotBlank(), modifier = Modifier.fillMaxWidth()) { Text("保存设置") }
-        TextButton(onClick = onDelete, modifier = Modifier.align(Alignment.CenterHorizontally)) { Text("移除此相册", color = MaterialTheme.colorScheme.error) }
+            if (seconds != null && seconds in 1..3600 && draft.name.isNotBlank()) { onSave(draft.copy(intervalSeconds = seconds, name = draft.name.trim())) }
+        }, enabled = interval.toIntOrNull() in 1..3600 && draft.name.isNotBlank() && focusDurationValid, modifier = Modifier.fillMaxWidth()) { Text("保存设置") }
     }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun AnimationSettings(album: Album, onDurationValidity: (Boolean) -> Unit, onChange: (Album) -> Unit) {
+    Text("照片切换动效", style = MaterialTheme.typography.titleSmall)
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        SlideEffect.entries.forEach { effect ->
+            FilterChip(album.transitionEffect == effect, { onChange(album.copy(transitionEffect = effect,
+                transitionMillis = if (album.transitionMillis == 0 && effect != SlideEffect.NONE) 700 else album.transitionMillis)) },
+                label = { Text(effect.title) }, modifier = Modifier.testTag("effect-${effect.name}"))
+        }
+    }
+    Text("随机轮换会打乱五种动效，依次用完再重新排列。", style = MaterialTheme.typography.bodySmall)
+    Text("切换动画速度", style = MaterialTheme.typography.labelLarge)
+    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        AnimationSpeed.entries.forEach { speed ->
+            val selected = when (speed) {
+                AnimationSpeed.HIGH -> album.transitionMillis in 1..450
+                AnimationSpeed.MEDIUM -> album.transitionMillis in 451..900
+                AnimationSpeed.LOW -> album.transitionMillis > 900
+            }
+            FilterChip(selected, { onChange(album.copy(transitionMillis = speed.transitionMillis)) },
+                enabled = album.transitionEffect != SlideEffect.NONE,
+                label = { Text(speed.title) }, modifier = Modifier.testTag("transition-speed-${speed.name}"))
+        }
+    }
+    Text("焦点放大", style = MaterialTheme.typography.titleSmall)
+    ToggleRow("启用照片焦点放大", "在完整画面上放大至识别或手动焦点，完成后保持到换片", album.motionMode != MotionMode.OFF,
+        { onChange(album.copy(motionMode = if (it) MotionMode.FIT_ZOOM else MotionMode.OFF)) }, controlTag = "focus-animation-enabled")
+    Text("焦点放大速度", style = MaterialTheme.typography.labelLarge)
+    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        AnimationSpeed.entries.forEach { speed ->
+            FilterChip(album.focusDurationSeconds == speed.focusSeconds,
+                { onChange(album.copy(focusDurationSeconds = speed.focusSeconds)) },
+                label = { Text("${speed.title} · ${speed.focusSeconds}秒") }, modifier = Modifier.testTag("focus-speed-${speed.name}"))
+        }
+    }
+    var duration by remember(album.focusDurationSeconds) { mutableStateOf(album.focusDurationSeconds.toString()) }
+    LaunchedEffect(duration) { onDurationValidity(duration.toIntOrNull() in 1..3600) }
+    OutlinedTextField(duration, { value ->
+        if (value.length <= 4 && value.all(Char::isDigit)) {
+            duration = value
+            value.toIntOrNull()?.takeIf { it in 1..3600 }?.let { onChange(album.copy(focusDurationSeconds = it)) }
+        }
+    }, label = { Text("放大过程时长（秒）") }, supportingText = { Text("速度档位提供时长预设，也可自定义 1～3600 秒；超过停留时间时自动缩短。整体展示的图片保持完整画面。") },
+        isError = duration.toIntOrNull() !in 1..3600, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+        modifier = Modifier.fillMaxWidth().testTag("focus-duration"))
 }
 
 @Composable
@@ -690,7 +807,7 @@ private fun SettingsPage(library: LibraryState, actions: LibraryActions) {
         item {
             Row(Modifier.fillMaxWidth().padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
                 Icon(Icons.Outlined.FilterVintage, null, Modifier.size(30.dp), tint = MaterialTheme.colorScheme.primary)
-                Column { Text("暮光相册 · 家庭离线版", style = MaterialTheme.typography.titleSmall); Spacer(Modifier.height(4.dp)); Text("照片、音乐与回忆，都留在这台平板。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                Column { Text("暮光相册 · ${com.muguang.album.BuildConfig.VERSION_NAME}", style = MaterialTheme.typography.titleSmall); Spacer(Modifier.height(4.dp)); Text("本地相册，可选 AI 辅助识别。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
             }
         }
     }

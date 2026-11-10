@@ -22,7 +22,7 @@ import kotlinx.coroutines.withContext
 import com.muguang.album.analysis.decodeOriented
 
 @Composable
-fun MotionPicture(painter: Painter, photo: Photo, album: Album, paused: Boolean, token: Any, modifier: Modifier = Modifier, onFrame: (Long) -> Unit = {}) {
+fun MotionPicture(painter: Painter, photo: Photo, album: Album, paused: Boolean, token: Any, modifier: Modifier = Modifier, onFrame: (Long) -> Unit = {}, initialProgress: Float = 0f, onProgress: (Float) -> Unit = {}) {
     val context = LocalContext.current
     var blurred by remember(photo.uri, photo.modifiedAt) { mutableStateOf<android.graphics.Bitmap?>(null) }
     LaunchedEffect(photo.uri, photo.modifiedAt, album.blurBackground) {
@@ -48,16 +48,17 @@ fun MotionPicture(painter: Painter, photo: Photo, album: Album, paused: Boolean,
         }
     }
     DisposableEffect(blurred) { val bitmap = blurred; onDispose { bitmap?.recycle() } }
-    var progress by remember(token, photo.metadata.effectiveFocus, album.motionMode) { mutableFloatStateOf(0f) }
+    var progress by remember(token, photo.metadata.effectiveFocus, album.motionMode) { mutableFloatStateOf(initialProgress) }
     val requested = photo.metadata.customMotionMode?.let { runCatching { MotionMode.valueOf(it) }.getOrNull() } ?: album.motionMode
     val mode = remember(token, requested) { if (requested == MotionMode.MIXED) listOf(MotionMode.FIT_ZOOM, MotionMode.CROP_ZOOM).random() else requested }
-    LaunchedEffect(token, paused, photo.metadata.effectiveFocus, mode) {
+    LaunchedEffect(token, paused, photo.metadata.effectiveFocus, mode, album.effectiveFocusMillis) {
         if (paused) return@LaunchedEffect
         var previous = withFrameNanos { it }
         while (isActive && progress < 1f) {
             withFrameNanos { now ->
                 onFrame((now - previous)/1_000_000)
-                progress = (progress + (now - previous) / (album.intervalSeconds * 1_000_000_000f)).coerceAtMost(1f)
+                progress = com.muguang.album.playback.focusProgress(progress, (now - previous) / 1_000_000f, album.effectiveFocusMillis)
+                onProgress(progress)
                 previous = now
             }
         }
@@ -74,10 +75,10 @@ fun MotionPicture(painter: Painter, photo: Photo, album: Album, paused: Boolean,
         val intrinsic = painter.intrinsicSize
         if (!intrinsic.width.isFinite() || !intrinsic.height.isFinite() || intrinsic.width <= 0 || intrinsic.height <= 0) return@Canvas
         val path = SmartMotion.plan(intrinsic.width, intrinsic.height, size.width, size.height,
-            if (mode == MotionMode.OFF) MotionMode.FIT_ZOOM else mode, photo.metadata.effectiveFocus,
+            if (mode == MotionMode.OFF || photo.metadata.wholeView) MotionMode.FIT_ZOOM else mode, photo.metadata.effectiveFocus,
             if (photo.metadata.manualFocus != null) null else photo.metadata.safeRegion,
-            if (mode == MotionMode.OFF) 0f else album.motionStrength, album.maxCrop)
-        val frame = path.frame(progress)
+            if (mode == MotionMode.OFF || photo.metadata.wholeView) 0f else album.motionStrength, album.maxCrop)
+        val frame = path.frame(progress * progress * (3f - 2f * progress))
         withTransform({ translate(frame.x, frame.y); scale(frame.scale, frame.scale, Offset.Zero) }) {
             with(painter) { draw(Size(intrinsic.width, intrinsic.height)) }
         }

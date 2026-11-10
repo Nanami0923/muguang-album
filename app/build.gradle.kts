@@ -12,8 +12,8 @@ android {
         applicationId = "com.muguang.album"
         minSdk = 24
         targetSdk = 36
-        versionCode = 5
-        versionName = "0.2.3"
+        versionCode = 7
+        versionName = "0.3.1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
         externalNativeBuild { cmake { cppFlags += "-std=c++17" } }
@@ -40,7 +40,7 @@ android {
     sourceSets.getByName("androidTest").assets.srcDir("schemas")
     ndkVersion = "27.0.12077973"
     externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt"); version = "3.22.1" } }
-    androidResources { noCompress += "tflite" }
+    androidResources { noCompress += listOf("tflite", "onnx") }
 }
 
 kotlin { compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) } }
@@ -49,6 +49,7 @@ ksp { arg("room.schemaLocation", "$projectDir/schemas") }
 dependencyLocking { lockAllConfigurations() }
 
 dependencies {
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.22.0")
     implementation("com.google.ai.edge.litert:litert:2.2.0")
     implementation("org.opencv:opencv:4.12.0")
     implementation("androidx.core:core-ktx:1.13.1")
@@ -76,6 +77,7 @@ dependencies {
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
     debugImplementation("androidx.compose.ui:ui-tooling:1.7.8")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation("androidx.test:rules:1.6.1")

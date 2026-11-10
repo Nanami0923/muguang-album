@@ -16,7 +16,19 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.*
 
-data class Detection(val region: SafeRegion, val confidence: Float)
+data class Detection(val region: SafeRegion, val confidence: Float, val label: Int = 0)
+data class MediumScores(val probabilities: List<Double>) {
+    val medium: String get() {
+        val ranked=probabilities.indices.sortedByDescending { probabilities[it] }
+        if(probabilities[ranked[0]]<AnalysisThresholds.CLASS_CONFIDENCE || probabilities[ranked[0]]-probabilities[ranked[1]]<AnalysisThresholds.CLASS_MARGIN) return "UNKNOWN"
+        return listOf("ANIME_ILLUSTRATION","REAL","RENDERED")[ranked[0]]
+    }
+    val coarse: String get() = when {
+        probabilities[1]>=.85 && probabilities[1]-(probabilities[0]+probabilities[2])>=.2 -> "REAL"
+        probabilities[0]+probabilities[2]>=.85 && probabilities[0]+probabilities[2]-probabilities[1]>=.2 -> "ART"
+        else -> "UNKNOWN"
+    }
+}
 interface ImageClassifier { fun classify(image: Bitmap): String }
 interface PersonDetector { fun detect(image: Bitmap): List<Detection> }
 interface FaceDetector { fun detect(image: Bitmap): List<Detection> }
@@ -72,7 +84,8 @@ private fun model(context: Context, name: String): Interpreter {
 
 class EfficientNetClassifier(context: Context) : ImageClassifier {
     private val interpreter = model(context, "image_medium_efficientnet_b0_fp32.tflite")
-    override fun classify(image: Bitmap): String {
+    override fun classify(image: Bitmap): String = predict(image).coarse
+    fun predict(image: Bitmap): MediumScores {
         val resized = Bitmap.createScaledBitmap(image, 224, 224, true)
         val pixels = IntArray(224 * 224); resized.getPixels(pixels, 0, 224, 0, 0, 224, 224)
         val input = ByteBuffer.allocateDirect(224 * 224 * 3 * 4).order(ByteOrder.nativeOrder())
@@ -83,15 +96,14 @@ class EfficientNetClassifier(context: Context) : ImageClassifier {
         val output = Array(1) { FloatArray(3) }; interpreter.run(input, output)
         val logits = output[0]; val peak = logits.maxOrNull()!!
         val exp = logits.map { exp((it - peak).toDouble()) }; val sum = exp.sum()
-        val probabilities = exp.map { it / sum }; val index = probabilities.indices.maxBy { probabilities[it] }
-        if (probabilities[index] < AnalysisThresholds.CLASS_CONFIDENCE || probabilities.sortedDescending().let { it[0] - it[1] } < AnalysisThresholds.CLASS_MARGIN) return "UNKNOWN"
-        return if (index == 1) "REAL" else "ART"
+        return MediumScores(exp.map { it / sum })
     }
 }
 
 class EfficientDetPersonDetector(context: Context) : PersonDetector {
     private val interpreter = model(context, "efficientdet_lite0_int8.tflite")
-    override fun detect(image: Bitmap): List<Detection> {
+    override fun detect(image: Bitmap): List<Detection> = detectObjects(image).filter { it.label==0 && it.confidence>=AnalysisThresholds.PERSON_CONFIDENCE }
+    fun detectObjects(image: Bitmap): List<Detection> {
         val inputTensor = interpreter.getInputTensor(0)
         val size = inputTensor.shape()[1]
         val resized = Bitmap.createScaledBitmap(image, size, size, true)
@@ -111,10 +123,11 @@ class EfficientDetPersonDetector(context: Context) : PersonDetector {
         val scores = outputs.getValue(2).apply { rewind() }.asFloatBuffer()
         val count = outputs.getValue(3).apply { rewind() }.float.toInt().coerceIn(0, scores.capacity())
         return (0 until count).mapNotNull { i ->
-            if (classes[i].roundToInt() != 0 || scores[i] < AnalysisThresholds.PERSON_CONFIDENCE) return@mapNotNull null
+            if (scores[i] < .4f) return@mapNotNull null
             val top = boxes[i * 4].coerceIn(0f, 1f); val left = boxes[i * 4 + 1].coerceIn(0f, 1f)
             val bottom = boxes[i * 4 + 2].coerceIn(top, 1f); val right = boxes[i * 4 + 3].coerceIn(left, 1f)
-            Detection(SafeRegion(left, top, right - left, bottom - top), scores[i])
+            if(right<=left || bottom<=top) return@mapNotNull null
+            Detection(SafeRegion(left, top, right - left, bottom - top), scores[i], classes[i].roundToInt())
         }
     }
 }
@@ -184,51 +197,96 @@ class SpectralResidualLocator : SubjectLocator {
 }
 
 class OfflinePhotoAnalyzer(private val context: Context) {
-    companion object { const val VERSION = "medium-b0-fp32-v1+det-lite0-int8-v1+libface-v1+spectral-v1+exif-v1" }
-    private val classifier: ImageClassifier by lazy { EfficientNetClassifier(context) }
-    private val person: PersonDetector by lazy { EfficientDetPersonDetector(context) }
-    private val face: FaceDetector by lazy { BundledFaceDetector() }
-    private val subject: SubjectLocator by lazy { SpectralResidualLocator() }
+    companion object { const val VERSION = "v030-medium1-real1-anime1-u2netp1-exif1" }
+    private val classifier by lazy { EfficientNetClassifier(context) }
+    private val person by lazy { EfficientDetPersonDetector(context) }
+    private val face by lazy { BundledFaceDetector() }
+    private val animePerson by lazy { AnimeDetector(context,false) }
+    private val animeFace by lazy { AnimeDetector(context,true) }
+    private val learned by lazy { LearnedSubjectLocator(context) }
+    private val spectral by lazy { SpectralResidualLocator() }
 
-    fun analyze(uri: String): PhotoMetadata {
-        val decoded = decodeOriented(context, uri)
-        val bitmap = decoded.bitmap
+    fun fingerprint(uri:String):String {
+        val digest=java.security.MessageDigest.getInstance("SHA-256")
+        context.contentResolver.openInputStream(Uri.parse(uri))!!.use { stream ->
+            val buffer=ByteArray(65536)
+            while(true) { val count=stream.read(buffer); if(count<0) break; digest.update(buffer,0,count) }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+    fun analyze(uri:String):PhotoMetadata {
+        val fingerprint=fingerprint(uri)
+        val decoded=decodeOriented(context,uri)
+        val bitmap=decoded.bitmap
+        val disputes=linkedSetOf<String>()
+        fun <T> safely(fallback:T, action:()->T):T = try { action() } catch(_:Exception) {
+            disputes+="LOCAL_COMPONENT_ERROR"; fallback
+        } catch(_:LinkageError) { disputes+="LOCAL_COMPONENT_ERROR"; fallback }
         try {
-            var category = classifier.classify(bitmap)
-            var source = "SALIENCY"
-            var region: SafeRegion? = null
-            if (category == "REAL") {
-                val people = person.detect(bitmap).filter { detection ->
-                    val r = detection.region; val area = r.width * r.height
-                    area >= AnalysisThresholds.PERSON_MAIN_AREA || (area >= AnalysisThresholds.PERSON_CENTRAL_AREA && r.x + r.width/2 in .2f.. .8f && detection.confidence >= .7f)
-                }
-                category = if (people.isEmpty()) "REAL_OTHER" else "REAL_PERSON"
-                if (people.isNotEmpty()) {
-                    val bodies = union(people.map { it.region })
-                    val faces = face.detect(bitmap).filter { f -> people.any { p ->
-                        val cx = f.region.x + f.region.width/2; val cy = f.region.y + f.region.height/2
-                        cx in p.region.x..(p.region.x+p.region.width) && cy in p.region.y..(p.region.y+p.region.height)
-                    } }
-                    region = if (faces.isNotEmpty()) union(faces.map { it.region }) else bodies
-                    source = if (faces.isNotEmpty()) "FACE" else "PERSON"
-                    // Preserve the major people, even when the aim point is a face.
-                    val point = FocusPoint(region.x + region.width/2, region.y + region.height/2)
-                    return result(decoded, category, point, bodies, source)
+            val prediction=safely(MediumScores(listOf(.333,.334,.333))) { classifier.predict(bitmap) }
+            val medium=prediction.medium
+            if(medium=="UNKNOWN") disputes+="MEDIUM_UNCERTAIN"
+            val objects=if(medium!="ANIME_ILLUSTRATION") safely(emptyList<Detection>()) { person.detectObjects(bitmap) } else emptyList()
+            val realBodies=objects.filter { it.label==0 && it.confidence>=AnalysisThresholds.PERSON_CONFIDENCE }
+            val animeBodies=if(medium!="REAL") safely(emptyList<Detection>()) { animePerson.detect(bitmap) } else emptyList()
+            val faces=when(medium) {
+                "REAL" -> if(realBodies.isNotEmpty()) safely(emptyList<Detection>()) { face.detect(bitmap) } else emptyList()
+                "ANIME_ILLUSTRATION", "RENDERED" -> safely(emptyList<Detection>()) { animeFace.detect(bitmap) }
+                else -> emptyList()
+            }
+            val bodies=if(medium=="REAL") realBodies else animeBodies
+            val major=bodies.filter { detection ->
+                val r=detection.region; val area=r.width*r.height
+                if(medium=="REAL") area>=AnalysisThresholds.PERSON_MAIN_AREA ||
+                    (area>=AnalysisThresholds.PERSON_CENTRAL_AREA && r.x+r.width/2 in .2f.. .8f && detection.confidence>=.7f)
+                else area>=.12f
+            }
+            val independentFaces=faces.filter { f -> bodies.none { regionOverlap(it.region,f.region)>.5f } }
+            val faceCloseup=independentFaces.filter { it.region.width*it.region.height>=.035f }
+            val peopleCount=bodies.size+independentFaces.size
+            val people=when { medium=="UNKNOWN" -> "UNKNOWN"; peopleCount==0 -> "NONE"; peopleCount==1 -> "SINGLE"; else -> "MULTIPLE" }
+            var composition=if(major.isNotEmpty() || faceCloseup.isNotEmpty()) "PERSON" else "OTHER"
+            var source="NONE"
+            var region:SafeRegion?=null
+            var point:FocusPoint?=null
+            if(composition=="PERSON") {
+                val protected=major.map { it.region }+faceCloseup.map { it.region }
+                region=regionUnion(protected)
+                val mainFaces=faces.filter { f -> protected.any { regionOverlap(it,f.region)>.5f } }
+                val aim=if(mainFaces.isNotEmpty()) regionUnion(mainFaces.map { it.region }) else region
+                point=FocusPoint(aim.x+aim.width/2,aim.y+aim.height/2)
+                source=if(medium=="REAL") { if(mainFaces.isNotEmpty()) "FACE" else "PERSON" } else { if(mainFaces.isNotEmpty()) "ANIME_FACE" else "ANIME_PERSON" }
+            } else {
+                region=safely<SafeRegion?>(null) { learned.locate(bitmap) }
+                if(region!=null) {
+                    val first=region
+                    val auxiliary=objects.filter { it.label!=0 }.maxByOrNull { regionOverlap(it.region,first) }
+                    val second=if(auxiliary!=null) auxiliary.region else {
+                        val matrix=Matrix().apply { setScale(-1f,1f) }
+                        val flipped=Bitmap.createBitmap(bitmap,0,0,bitmap.width,bitmap.height,matrix,true)
+                        try { safely<SafeRegion?>(null) { learned.locate(flipped) }?.let { SafeRegion(1-it.x-it.width,it.y,it.width,it.height) } }
+                        finally { if(flipped!==bitmap) flipped.recycle() }
+                    }
+                    if(second==null || !subjectAgreement(first,second,decoded.width,decoded.height)) disputes+="FOCUS_UNSTABLE"
+                    point=FocusPoint(first.x+first.width/2,first.y+first.height/2); source="LEARNED_SUBJECT"
+                } else disputes+="NO_RELIABLE_SUBJECT"
+                // Visual saliency can support location, but cannot decide whether content is scenery.
+                safely<SafeRegion?>(null) { spectral.locate(bitmap) }
+                if(peopleCount>0 || objects.none { it.label!=0 }) {
+                    composition="UNKNOWN"; disputes+="COMPOSITION_UNCERTAIN"
                 }
             }
-            region = subject.locate(bitmap)
-            val point = region?.let { FocusPoint(it.x + it.width/2, it.y + it.height/2) }
-            return result(decoded, category, point, region, if (point != null) source else "NONE")
+            if(medium=="UNKNOWN" && realBodies.isNotEmpty() && animeBodies.isNotEmpty()) disputes+="MEDIUM_EVIDENCE_CONFLICT"
+            val category=categoryFor(medium,composition)
+            val needsAi=disputes.isNotEmpty()
+            return PhotoMetadata(orientedWidth=decoded.width,orientedHeight=decoded.height,exifOrientation=decoded.orientation,
+                autoCategory=if(medium=="REAL") "REAL" else if(medium=="UNKNOWN" && prediction.coarse=="ART") "ART" else category,
+                autoSubCategory=category.takeIf { medium=="REAL" },classificationStatus=if(medium=="UNKNOWN") "UNKNOWN" else "DONE",
+                autoX=point?.x,autoY=point?.y,regionX=region?.x,regionY=region?.y,regionWidth=region?.width,regionHeight=region?.height,
+                focusSource=source,focusStatus=if(point==null) "NEEDS_MANUAL" else "DETECTED",taskState="DONE",modelVersion=VERSION,
+                medium=medium,composition=composition,people=people,presentation=if(point==null) "UNRESOLVED" else "SUBJECT_FOCUS",
+                fingerprint=fingerprint,disputeReasons=disputes.joinToString(","),aiStatus=if(needsAi) "WAITING_CONFIG" else "NOT_REQUIRED",
+                localEvidence="medium="+prediction.probabilities.joinToString(",") { "%.4f".format(java.util.Locale.US,it) }+";bodies=$peopleCount;focus=$source")
         } finally { bitmap.recycle() }
-    }
-    private fun result(image: OrientedImage, category: String, point: FocusPoint?, region: SafeRegion?, source: String) = PhotoMetadata(
-        orientedWidth = image.width, orientedHeight = image.height, exifOrientation = image.orientation,
-        autoCategory = if (category.startsWith("REAL_")) "REAL" else category,
-        autoSubCategory = category.takeIf { it.startsWith("REAL_") }, classificationStatus = "DONE", autoX = point?.x, autoY = point?.y,
-        regionX = region?.x, regionY = region?.y, regionWidth = region?.width, regionHeight = region?.height,
-        focusSource = source, focusStatus = if (point == null) "NEEDS_MANUAL" else "DETECTED", taskState = "DONE", modelVersion = VERSION)
-    private fun union(regions: List<SafeRegion>): SafeRegion {
-        val x = regions.minOf { it.x }; val y = regions.minOf { it.y }
-        return SafeRegion(x, y, regions.maxOf { it.x+it.width } - x, regions.maxOf { it.y+it.height } - y)
     }
 }

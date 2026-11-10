@@ -27,6 +27,10 @@ import com.muguang.album.core.PhotoCategory
 import com.muguang.album.core.MotionMode
 import com.muguang.album.core.PhotoMetadata
 import com.muguang.album.analysis.OfflinePhotoAnalyzer
+import com.muguang.album.analysis.ai.*
+import com.muguang.album.core.AiSettings
+import com.muguang.album.core.preserveManual
+import com.muguang.album.core.USER_REMOVED_PHOTO
 import com.muguang.album.playback.stableAutoFocus
 import com.muguang.album.playback.TRASH_RETENTION_MILLIS
 import kotlinx.coroutines.delay
@@ -59,7 +63,7 @@ private val Context.albumPreferences by preferencesDataStore(name = "album_prefe
 class LocalAlbumRepository(context: Context, scope: CoroutineScope) : AlbumRepository {
     private val appContext = context.applicationContext
     private val resolver = appContext.contentResolver
-    private val database = Room.databaseBuilder(appContext, AlbumDatabase::class.java, "muguang-album.db").addMigrations(SMART_MIGRATION).build()
+    private val database = Room.databaseBuilder(appContext, AlbumDatabase::class.java, "muguang-album.db").addMigrations(SMART_MIGRATION, RECOGNITION_MIGRATION, PLAYBACK_MIGRATION).build()
     private val dao = database.dao()
     private val scanner = SafScanner(resolver)
     private val mutationMutex = Mutex()
@@ -76,6 +80,9 @@ class LocalAlbumRepository(context: Context, scope: CoroutineScope) : AlbumRepos
         Thread({ android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND); task.run() }, "photo-analysis")
     }.asCoroutineDispatcher()
     private val analyzer by lazy { OfflinePhotoAnalyzer(appContext) }
+    private val aiConfig = AiConfiguration(appContext)
+    private val aiRequestMutex = Mutex()
+    private val aiRecognizer: AiPhotoRecognizer = ChatCompletionsPhotoRecognizer()
 
     override fun setForeground(value: Boolean) { foreground = value }
     override fun setPlaying(value: Boolean) { playing = value }
@@ -108,8 +115,8 @@ class LocalAlbumRepository(context: Context, scope: CoroutineScope) : AlbumRepos
             )
         }
         scope.launch(Dispatchers.IO) {
-            combine(storedLibrary, preferences, scanning, initialized) { library, prefs, scanningIds, ready ->
-                library.copy(preferences = prefs, scanningSourceIds = scanningIds, initialized = ready)
+            combine(storedLibrary, preferences, scanning, initialized, aiConfig.state) { library, prefs, scanningIds, ready, ai ->
+                library.copy(preferences = prefs, scanningSourceIds = scanningIds, initialized = ready, ai = ai)
             }.collect { mutableState.value = it }
         }
         scope.launch(Dispatchers.IO) {
@@ -127,7 +134,7 @@ class LocalAlbumRepository(context: Context, scope: CoroutineScope) : AlbumRepos
                     dao.nextAnalysis()?.also { dao.insertPhotos(listOf(it.copy(metadata = it.metadata.copy(taskState = "PROCESSING")))) }
                 }
                 if (photo == null) { delay(700); continue }
-                val cached = dao.photosById(photo.id).firstOrNull { it.sourceId != photo.sourceId && it.trashedAt == null &&
+                val cached = if (photo.metadata.classificationStatus == "REANALYZE") null else dao.photosById(photo.id).firstOrNull { it.sourceId != photo.sourceId && it.trashedAt == null &&
                     it.modifiedAt == photo.modifiedAt && it.fileSize == photo.fileSize && it.metadata.taskState == "DONE" && it.metadata.modelVersion == OfflinePhotoAnalyzer.VERSION }
                 var missing = false
                 val result = try { cached?.metadata ?: withContext(inferenceDispatcher) { analyzer.analyze(photo.uri) } }
@@ -139,22 +146,156 @@ class LocalAlbumRepository(context: Context, scope: CoroutineScope) : AlbumRepos
                 catch (error: LinkageError) { PhotoMetadata(taskState = "FAILED", focusStatus = "ERROR", classificationStatus = "ERROR", error = "设备不支持当前离线识别组件") }
                 mutationMutex.withLock {
                     val latest = dao.photo(photo.sourceId, photo.id)
-                    if (latest != null && latest.trashedAt == null && latest.modifiedAt == photo.modifiedAt && latest.fileSize == photo.fileSize && latest.metadata.taskState == "PROCESSING") {
+                    if (latest != null && latest.trashedAt == null && latest.modifiedAt == photo.modifiedAt && latest.fileSize == photo.fileSize && latest.metadata.generation == photo.metadata.generation && latest.metadata.taskState == "PROCESSING") {
                         val manual = latest.metadata
-                        val point = stableAutoFocus(manual.autoFocus, result.autoFocus, result.orientedWidth, result.orientedHeight)
+                        val point = if(manual.modelVersion==result.modelVersion && manual.classificationSource!="AI") stableAutoFocus(manual.autoFocus, result.autoFocus, result.orientedWidth, result.orientedHeight) else result.autoFocus
                         val source = dao.source(photo.sourceId)
                         val merged = if (!foreground || source?.analysisState == "CANCELLED") manual.copy(taskState = if (source?.analysisState == "CANCELLED") "CANCELLED" else "QUEUED")
                         else result.copy(autoX = point?.x, autoY = point?.y, manualX = manual.manualX, manualY = manual.manualY,
                             manualCategory = manual.manualCategory, customMotionMode = manual.customMotionMode,
                             focusStatus = when { manual.manualFocus != null -> "MANUAL"; result.focusStatus != "MANUAL" -> result.focusStatus;
                                 point != null -> "DETECTED"; else -> "NEEDS_MANUAL" })
-                        dao.insertPhotos(listOf(latest.copy(metadata = merged, trashedAt = if (missing) System.currentTimeMillis() else latest.trashedAt,
+                        val retained = if(manual.classificationSource=="AI" && manual.fingerprint.isNotEmpty() && manual.fingerprint==result.fingerprint && merged.taskState=="DONE")
+                            manual.copy(taskState="DONE",modelVersion=result.modelVersion) else merged
+                        val final = preserveManual(retained,manual).let { fresh ->
+                            if(fresh.aiStatus=="WAITING_CONFIG" && aiConfig.state.value.configured && aiConfig.state.value.enabled) fresh.copy(aiStatus="QUEUED") else fresh
+                        }
+                        dao.insertPhotos(listOf(latest.copy(metadata = final, trashedAt = if (missing) System.currentTimeMillis() else latest.trashedAt,
                             unavailableReason = if (missing) "文件不存在或授权失效" else latest.unavailableReason)))
                     }
                 }
                 // Yield between pictures; playback never waits for model inference.
                 delay(if (playing) 1500 else 100)
             }
+        }
+        scope.launch(Dispatchers.IO) { runAiQueue() }
+    }
+
+    private suspend fun runAiQueue() {
+        while(true) {
+            val config=aiConfig.state.value
+            if(!foreground || !initialized.value || !config.enabled || !config.configured || config.paused) { delay(700); continue }
+            if(config.sent>=config.maxImagesPerRun) { aiConfig.status("本轮数量已用完，开始新一轮可继续",true); continue }
+            val photo=mutationMutex.withLock {
+                dao.queueConfiguredAi()
+                dao.nextAi()?.let { it.copy(metadata=it.metadata.copy(aiStatus="PROCESSING",aiError=null)).also { claimed -> dao.insertPhotos(listOf(claimed)) } }
+            }
+            if(photo==null) { delay(700); continue }
+            processAi(photo,config)
+            delay(150)
+        }
+    }
+
+    private fun aiImage(uri:String,maxSide:Int):ByteArray {
+        val decoded=com.muguang.album.analysis.decodeOriented(appContext,uri,maxSide)
+        val bitmap=decoded.bitmap
+        try {
+            val factor=minOf(1f,maxSide.toFloat()/maxOf(bitmap.width,bitmap.height))
+            val output=android.graphics.Bitmap.createBitmap((bitmap.width*factor).toInt().coerceAtLeast(1),(bitmap.height*factor).toInt().coerceAtLeast(1),android.graphics.Bitmap.Config.ARGB_8888)
+            try {
+                val canvas=android.graphics.Canvas(output); canvas.drawColor(android.graphics.Color.WHITE)
+                canvas.drawBitmap(bitmap,null,android.graphics.Rect(0,0,output.width,output.height),android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG))
+                return java.io.ByteArrayOutputStream().use { stream -> check(output.compress(android.graphics.Bitmap.CompressFormat.JPEG,85,stream)); stream.toByteArray() }
+            } finally { output.recycle() }
+        } finally { bitmap.recycle() }
+    }
+
+    private suspend fun processAi(photo:PhotoEntity,config:AiSettings) {
+        val key=aiCacheKey(photo.metadata.fingerprint,config)
+        try {
+            check(photo.metadata.fingerprint.isNotBlank()) { "请先完成本地识别" }
+            if(analyzer.fingerprint(photo.uri)!=photo.metadata.fingerprint) { requeueChanged(photo); return }
+            val cached=dao.aiCache(key)
+            val response=if(cached!=null) AiResponse(AiResultParser.parse(cached.result),cached.result,cached.requestId,cached.inputTokens,cached.outputTokens) else {
+                val image=aiImage(photo.uri,config.maxImageSide)
+                if(analyzer.fingerprint(photo.uri)!=photo.metadata.fingerprint) { requeueChanged(photo); return }
+                aiRequestMutex.withLock {
+                    val permitted = mutationMutex.withLock {
+                        val latest = dao.photo(photo.sourceId, photo.id)
+                        if (latest == null || latest.trashedAt != null || latest.metadata.generation != photo.metadata.generation || latest.metadata.aiStatus != "PROCESSING") false
+                        else if (!foreground || !aiConfig.reserve()) {
+                            dao.insertPhotos(listOf(latest.copy(metadata = latest.metadata.copy(aiStatus = "QUEUED"))))
+                            false
+                        } else true
+                    }
+                    if (!permitted) return
+                    aiConfig.status("正在识别争议图片")
+                    aiRecognizer.analyze(config, aiConfig.secret(), image)
+                }
+            }
+            if(analyzer.fingerprint(photo.uri)!=photo.metadata.fingerprint) { requeueChanged(photo); return }
+            mutationMutex.withLock {
+                val latest=dao.photo(photo.sourceId,photo.id)
+                if(latest!=null && latest.trashedAt==null && latest.modifiedAt==photo.modifiedAt && latest.fileSize==photo.fileSize && latest.metadata.generation==photo.metadata.generation && latest.metadata.aiStatus=="PROCESSING") {
+                    dao.saveAiCache(AiResultEntity(key,photo.metadata.fingerprint,response.content,config.model,response.requestId,response.inputTokens,response.outputTokens,System.currentTimeMillis()))
+                    val fresh=preserveManual(response.result.applyTo(latest.metadata),latest.metadata).copy(aiCacheKey=key)
+                    dao.insertPhotos(listOf(latest.copy(metadata=fresh)))
+                }
+            }
+            aiConfig.status(if(cached!=null) "已复用识别结果，未发起付费请求" else "AI 结果已保存")
+        } catch(cancelled:CancellationException) { throw cancelled }
+        catch(failure:Exception) {
+            val kind=(failure as? AiFailure)?.kind ?: "LOCAL"
+            val message=if(failure is AiFailure) failure.message!! else "图片读取或密钥读取失败，请检查后重试"
+            mutationMutex.withLock {
+                val latest=dao.photo(photo.sourceId,photo.id)
+                if(latest!=null && latest.metadata.generation==photo.metadata.generation && latest.metadata.aiStatus=="PROCESSING")
+                    dao.insertPhotos(listOf(latest.copy(metadata=latest.metadata.copy(aiStatus=if(kind=="UNKNOWN_OUTCOME") kind else "FAILED",aiError=message))))
+            }
+            aiConfig.status(message,if(kind in setOf("AUTH","CONFIG","RATE_LIMIT","UNKNOWN_OUTCOME","LOCAL")) true else null)
+        }
+    }
+
+    private suspend fun requeueChanged(photo:PhotoEntity) = mutationMutex.withLock {
+        dao.photo(photo.sourceId,photo.id)?.takeIf { it.metadata.generation==photo.metadata.generation }?.let {
+            dao.insertPhotos(listOf(it.copy(metadata=it.metadata.copy(taskState="QUEUED",aiStatus="NOT_REQUIRED",generation=it.metadata.generation+1))))
+        }
+    }
+
+    override suspend fun saveAiSettings(settings:AiSettings,apiKey:String?) = withContext(Dispatchers.IO) {
+        aiConfig.save(settings,apiKey)
+        if(settings.enabled) mutationMutex.withLock { dao.queueConfiguredAi() }
+    }
+
+    override suspend fun aiCommand(command:String,photoId:String?):Unit = withContext(Dispatchers.IO) {
+        when(command) {
+            "PAUSE" -> aiConfig.status("AI 队列已暂停，在途请求仍可能完成",true)
+            "RESUME" -> aiConfig.status("AI 队列已继续",false)
+            "NEW_BATCH" -> aiConfig.newBatch()
+            "CANCEL" -> mutationMutex.withLock {
+                for(source in dao.sources()) dao.insertPhotos(dao.sourcePhotos(source.id).filter { it.metadata.aiStatus in setOf("QUEUED","WAITING_CONFIG") }.map { it.copy(metadata=it.metadata.copy(aiStatus="CANCELLED")) })
+            }
+            "RETRY", "REANALYZE" -> mutationMutex.withLock {
+                val targets=if(photoId!=null) dao.photosById(photoId) else dao.sources().flatMap { dao.sourcePhotos(it.id) }.filter { it.metadata.aiStatus=="FAILED" }
+                for(photo in targets.filter { it.trashedAt==null }) {
+                    require(photo.metadata.taskState=="DONE" && photo.metadata.fingerprint.isNotBlank()) { "请先等待本地识别完成；旧图片可先执行全部重识别" }
+                    if(command=="REANALYZE" && photo.metadata.fingerprint.isNotBlank()) dao.deleteAiCache(aiCacheKey(photo.metadata.fingerprint,aiConfig.state.value))
+                    dao.insertPhotos(listOf(photo.copy(metadata=photo.metadata.copy(generation=photo.metadata.generation+1,aiError=null,
+                        taskState=if(photo.metadata.fingerprint.isBlank()) "QUEUED" else photo.metadata.taskState,
+                        aiStatus=if(aiConfig.state.value.configured && aiConfig.state.value.enabled) "QUEUED" else "WAITING_CONFIG"))))
+                }
+            }
+        }
+    }
+
+    override suspend fun testAiConnection():String = withContext(Dispatchers.IO) {
+        val config=aiConfig.state.value
+        require(config.configured && config.enabled) { "请保存并启用完整 API 配置" }
+        check(aiConfig.reserve()) { "AI 已暂停或本轮数量已用完" }
+        val bitmap=android.graphics.Bitmap.createBitmap(160,120,android.graphics.Bitmap.Config.ARGB_8888)
+        try {
+            val canvas=android.graphics.Canvas(bitmap); canvas.drawColor(android.graphics.Color.WHITE)
+            canvas.drawRect(40f,20f,120f,100f,android.graphics.Paint().apply { color=android.graphics.Color.BLUE })
+            val bytes=java.io.ByteArrayOutputStream().use { bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG,85,it); it.toByteArray() }
+            aiRequestMutex.withLock { aiRecognizer.analyze(config,aiConfig.secret(),bytes) }
+            "连接、图片输入和结果格式均通过（已计入本轮调用数量）".also { aiConfig.status(it) }
+        } finally { bitmap.recycle() }
+    }
+
+    override suspend fun setPhotoPresentation(sourceId:String,photoId:String,presentation:String?) = withContext(Dispatchers.IO) {
+        require(presentation==null || presentation=="WHOLE_VIEW")
+        mutationMutex.withLock {
+            dao.insertPhotos(dao.photosById(photoId).map { it.copy(metadata=it.metadata.copy(manualPresentation=presentation)) })
         }
     }
 
@@ -164,6 +305,7 @@ class LocalAlbumRepository(context: Context, scope: CoroutineScope) : AlbumRepos
             mutationMutex.withLock {
                 dao.purgeTrash(System.currentTimeMillis() - TRASH_RETENTION_MILLIS)
                 dao.recoverAnalysis()
+                dao.recoverAi()
                 for (source in dao.sources()) {
                     val stale = dao.sourcePhotos(source.id).filter { it.metadata.taskState == "DONE" && it.metadata.modelVersion != OfflinePhotoAnalyzer.VERSION }
                     stale.chunked(200).forEach { chunk -> dao.insertPhotos(chunk.map { it.copy(metadata = it.metadata.copy(taskState = "QUEUED")) }) }
@@ -198,6 +340,7 @@ class LocalAlbumRepository(context: Context, scope: CoroutineScope) : AlbumRepos
         require(album.intervalSeconds in 1..3600) { "换片间隔应为 1～3600 秒" }
         require(album.musicVolume.isFinite() && album.musicVolume in 0f..1f) { "音乐音量应在 0～100% 之间" }
         require(album.transitionMillis in 0..2000) { "转场时长应为 0～2000 毫秒" }
+        require(album.focusDurationSeconds in 1..3600) { "焦点放大时长应为 1～3600 秒" }
         require(album.motionStrength.isFinite() && album.motionStrength in 0f..0.5f) { "动画强度无效" }
         require(album.maxCrop.isFinite() && album.maxCrop in 0f..0.85f) { "裁剪上限无效" }
         require(album.playbackCategories.split(',').filter { it.isNotBlank() }.all { name -> PhotoCategory.entries.any { it.name == name } }) { "播放类别无效" }
@@ -208,7 +351,7 @@ class LocalAlbumRepository(context: Context, scope: CoroutineScope) : AlbumRepos
                 "音乐文件夹已失效，请重新选择"
             }
             require(!album.musicEnabled || musicSource != null) { "请先选择音乐文件夹" }
-            val safeAlbum = album.copy(name = cleanName, transitionMillis = minOf(album.transitionMillis, album.intervalSeconds * 500))
+            val safeAlbum = album.copy(name = cleanName)
             database.withTransaction {
             dao.updateAlbum(
                 safeAlbum.id, safeAlbum.name, safeAlbum.intervalSeconds, safeAlbum.shuffle, safeAlbum.loop,
@@ -216,6 +359,7 @@ class LocalAlbumRepository(context: Context, scope: CoroutineScope) : AlbumRepos
                 safeAlbum.musicSourceId, safeAlbum.musicEnabled, safeAlbum.musicOrder.name, safeAlbum.musicVolume,
             )
             dao.smartSettings(album.id, album.motionMode.name, album.motionStrength, album.maxCrop, album.blurBackground, album.playbackCategories)
+            dao.animationSettings(album.id, album.transitionEffect.name, album.focusDurationSeconds)
             }
         }
     }
@@ -338,7 +482,7 @@ class LocalAlbumRepository(context: Context, scope: CoroutineScope) : AlbumRepos
         mutationMutex.withLock {
             val old = checkNotNull(dao.photo(sourceId, photoId)) { "照片索引已不存在" }
             dao.insertPhotos(dao.photosById(old.id).map { shared -> shared.copy(metadata = shared.metadata.copy(manualX = focus?.x, manualY = focus?.y,
-                manualCategory = category?.name, customMotionMode = motion?.name,
+                manualCategory = category?.name, customMotionMode = motion?.name, manualPresentation = if (focus != null) null else shared.metadata.manualPresentation,
                 focusStatus = when { focus != null -> "MANUAL"; shared.metadata.autoFocus != null -> "DETECTED";
                     shared.metadata.taskState == "FAILED" -> "ERROR"; shared.metadata.taskState in setOf("QUEUED", "PROCESSING") -> "PENDING"; else -> "NEEDS_MANUAL" })) })
         }
@@ -357,10 +501,54 @@ class LocalAlbumRepository(context: Context, scope: CoroutineScope) : AlbumRepos
                     command == "RESCAN" || (command == "RETRY" && task == "FAILED") || (command == "RESUME" && task == "CANCELLED") -> "QUEUED"
                     else -> null
                 }
-                next?.let { photo.copy(metadata = photo.metadata.copy(taskState = it, error = null)) }
+                next?.let { photo.copy(metadata = photo.metadata.copy(taskState = it, error = null, generation = photo.metadata.generation + 1)) }
             }
-            updates.chunked(200).forEach { dao.insertPhotos(it) }
+                    updates.chunked(200).forEach { dao.insertPhotos(it) }
         }
+    }
+
+    override suspend fun reanalyzePhoto(sourceId: String, photoId: String): Unit = withContext(Dispatchers.IO) {
+        mutationMutex.withLock {
+            val photo = checkNotNull(dao.photo(sourceId, photoId)) { "照片索引已不存在" }
+            check(photo.trashedAt == null) { "请先从回收站恢复图片" }
+            check(dao.source(sourceId)?.available == true) { "图片文件夹暂时无法读取，请重新授权" }
+            database.withTransaction {
+                // Explicit reanalysis bypasses the local cross-album cache. AI may reuse a paid result.
+                val fresh = preserveManual(PhotoMetadata(classificationStatus = "REANALYZE"), photo.metadata)
+                    .copy(generation = photo.metadata.generation + 1)
+                dao.insertPhotos(listOf(photo.copy(metadata = fresh)))
+                dao.analysisState(sourceId, "RUNNING")
+            }
+        }
+    }
+
+    override suspend fun removePhoto(sourceId: String, photoId: String): Unit = withContext(Dispatchers.IO) {
+        mutationMutex.withLock {
+            val albumId = checkNotNull(dao.source(sourceId)) { "相册来源已不存在" }.albumId
+            val sourceIds = dao.sources().filter { it.albumId == albumId }.map { it.id }.toSet()
+            val now = System.currentTimeMillis()
+            database.withTransaction {
+                // The same document can be referenced by overlapping folders in this album.
+                val targets = dao.photosById(photoId).filter { it.sourceId in sourceIds }
+                check(targets.isNotEmpty()) { "照片索引已不存在" }
+                dao.insertPhotos(targets.map { it.copy(trashedAt = now, unavailableReason = USER_REMOVED_PHOTO,
+                    metadata = it.metadata.copy(generation = it.metadata.generation + 1, taskState = "CANCELLED", aiStatus = "CANCELLED")) })
+            }
+        }
+    }
+
+    override suspend fun restorePhoto(sourceId: String, photoId: String): Unit = withContext(Dispatchers.IO) {
+        mutationMutex.withLock {
+            val albumId = checkNotNull(dao.source(sourceId)) { "相册来源已不存在" }.albumId
+            val sourceIds = dao.sources().filter { it.albumId == albumId }.map { it.id }.toSet()
+            database.withTransaction {
+                val targets = dao.photosById(photoId).filter { it.sourceId in sourceIds && it.unavailableReason == USER_REMOVED_PHOTO }
+                check(targets.isNotEmpty()) { "此图片无需恢复" }
+                dao.insertPhotos(targets.map { it.copy(trashedAt = null, unavailableReason = null,
+                    metadata = it.metadata.copy(generation = it.metadata.generation + 1, taskState = "QUEUED", aiStatus = "NOT_REQUIRED")) })
+            }
+        }
+        scan(sourceId)
     }
 
     override suspend fun markUnavailable(sourceId: String, photoId: String): Unit = withContext(Dispatchers.IO) {
@@ -371,7 +559,7 @@ class LocalAlbumRepository(context: Context, scope: CoroutineScope) : AlbumRepos
         catch (_: java.io.FileNotFoundException) { }
         catch (_: Exception) { return@withContext }
         mutationMutex.withLock {
-            dao.photo(sourceId, photoId)?.let { dao.insertPhotos(listOf(it.copy(trashedAt = it.trashedAt ?: System.currentTimeMillis(), unavailableReason = "文件不存在或授权失效"))) }
+            dao.photo(sourceId, photoId)?.takeIf { it.unavailableReason != USER_REMOVED_PHOTO }?.let { dao.insertPhotos(listOf(it.copy(trashedAt = it.trashedAt ?: System.currentTimeMillis(), unavailableReason = "文件不存在或授权失效"))) }
         }
     }
 
@@ -471,12 +659,14 @@ private fun Album.entity() = AlbumEntity(
     id, name, intervalSeconds, shuffle, loop, sortOrder.name, scale.name, transitionMillis,
     musicSourceId, musicEnabled, musicOrder.name, musicVolume,
     motionMode.name, motionStrength, maxCrop, blurBackground, playbackCategories,
+    transitionEffect.name, focusDurationSeconds,
 )
 
 private fun AlbumEntity.model() = Album(
     id, name, intervalSeconds, shuffle, loop, SortOrder.valueOf(sortOrder), PhotoScale.valueOf(scale), transitionMillis,
     musicSourceId, musicEnabled, MusicOrder.valueOf(musicOrder), musicVolume,
     MotionMode.valueOf(motionMode), motionStrength, maxCrop, blurBackground, playbackCategories,
+    com.muguang.album.core.SlideEffect.valueOf(transitionEffect), focusDurationSeconds,
 )
 
 private fun SourceEntity.model() = FolderSource(

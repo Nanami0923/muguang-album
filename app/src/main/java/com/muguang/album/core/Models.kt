@@ -1,11 +1,24 @@
 package com.muguang.album.core
 
 enum class SourceKind { PHOTO, MUSIC }
+const val USER_REMOVED_PHOTO = "已从当前相册移除"
 enum class SortOrder { NAME, MODIFIED }
 enum class MusicOrder { SEQUENTIAL, RANDOM }
 enum class PhotoScale { FIT, CROP }
+enum class SlideEffect(val title: String) {
+    RANDOM("随机轮换"), FADE("渐入渐出"), PAGE("翻页"), CUBE("方块转动"), STACK("叠层"), FLIP("单面旋转"), NONE("无动画")
+}
+enum class AnimationSpeed(val title: String, val transitionMillis: Int, val focusSeconds: Int) {
+    HIGH("高", 350, 3), MEDIUM("中", 700, 6), LOW("低", 1200, 10)
+}
 enum class MotionMode(val title: String) { OFF("普通播放"), FIT_ZOOM("A 完整后放大"), CROP_ZOOM("B 铺满后放大"), AUTO("自动"), MIXED("混合") }
-enum class PhotoCategory(val title: String) { REAL_PERSON("真实人物"), REAL_OTHER("真实非人物"), ART("绘画设计"), UNKNOWN("待分类") }
+enum class PhotoCategory(val title: String) {
+    REAL_PERSON("照片 · 人物"), REAL_OTHER("照片 · 景物与其他"),
+    ANIME_PERSON("动漫插画 · 人物"), ANIME_SCENERY("动漫插画 · 景物"), ANIME_OTHER("动漫插画 · 其他"),
+    RENDERED("游戏与三维渲染"), DESIGN("设计与排版"), MIXED("混合媒介"),
+    ART("绘画与设计（未细分）"), UNKNOWN("待确认类别");
+    fun includes(other: PhotoCategory) = this == other || (this == ART && other in setOf(ANIME_PERSON, ANIME_SCENERY, ANIME_OTHER, RENDERED, DESIGN))
+}
 
 data class FocusPoint(val x: Float, val y: Float)
 data class SafeRegion(val x: Float, val y: Float, val width: Float, val height: Float)
@@ -21,19 +34,42 @@ data class PhotoMetadata(
     val focusSource: String = "NONE", val focusStatus: String = "PENDING",
     val taskState: String = "QUEUED", val modelVersion: String = "",
     val error: String? = null, val customMotionMode: String? = null,
+    val medium: String = "UNKNOWN", val composition: String = "UNKNOWN", val people: String = "UNKNOWN",
+    val presentation: String = "UNRESOLVED", val manualPresentation: String? = null,
+    val classificationSource: String = "LOCAL", val disputeReasons: String = "",
+    val fingerprint: String = "", val localEvidence: String = "", val generation: Long = 0,
+    val aiStatus: String = "NOT_REQUIRED", val aiError: String? = null, val aiCacheKey: String = "",
 ) {
     val category: PhotoCategory get() = runCatching { PhotoCategory.valueOf(manualCategory ?: if (autoCategory == "REAL") autoSubCategory ?: "UNKNOWN" else autoCategory) }.getOrDefault(PhotoCategory.UNKNOWN)
     val manualFocus: FocusPoint? get() = manualX?.let { x -> manualY?.let { FocusPoint(x, it) } }
     val autoFocus: FocusPoint? get() = autoX?.let { x -> autoY?.let { FocusPoint(x, it) } }
-    val effectiveFocus: FocusPoint? get() = manualFocus ?: autoFocus
+    val wholeView: Boolean get() = manualPresentation == "WHOLE_VIEW" || (manualPresentation == null && manualFocus == null && presentation == "WHOLE_VIEW")
+    val effectiveFocus: FocusPoint? get() = if (wholeView) null else manualFocus ?: autoFocus
     val safeRegion: SafeRegion? get() = regionX?.let { x -> regionY?.let { y -> regionWidth?.let { w -> regionHeight?.let { SafeRegion(x, y, w, it) } } } }
     val displayStatus: String get() = when {
+        wholeView -> "整体展示"
         manualFocus != null -> "手动焦点"
         taskState == "FAILED" -> "识别错误"
         taskState == "QUEUED" || taskState == "PROCESSING" -> "待识别"
+        aiStatus == "PROCESSING" -> "AI 识别中"
+        aiStatus in setOf("QUEUED", "WAITING_CONFIG") -> "待 AI 识别"
+        aiStatus == "UNKNOWN_OUTCOME" -> "调用结果待确认"
+        aiStatus == "FAILED" -> "AI 调用失败"
+        aiStatus == "UNRESOLVED" -> "待人工调整"
+        aiStatus == "SUCCEEDED" -> "AI 已识别"
         autoFocus != null -> "自动定位"
         else -> "待选点"
     }
+    val categoryLabel: String get() = if(manualCategory==null && composition=="UNKNOWN") when(medium) {
+        "ANIME_ILLUSTRATION" -> "动漫插画 · 待细分"
+        "REAL" -> "照片 · 待细分"
+        else -> category.title
+    } else category.title
+    val detailLabel: String get() = listOfNotNull(
+        categoryLabel,
+        when (people) { "SINGLE" -> "单人"; "MULTIPLE" -> "多人"; else -> null },
+        when (composition) { "BALANCED" -> "人物与景物并重"; else -> null },
+    ).joinToString(" · ")
 }
 
 data class Album(
@@ -44,7 +80,7 @@ data class Album(
     val loop: Boolean = true,
     val sortOrder: SortOrder = SortOrder.NAME,
     val scale: PhotoScale = PhotoScale.FIT,
-    val transitionMillis: Int = 500,
+    val transitionMillis: Int = 700,
     val musicSourceId: String? = null,
     val musicEnabled: Boolean = false,
     val musicOrder: MusicOrder = MusicOrder.SEQUENTIAL,
@@ -54,7 +90,12 @@ data class Album(
     val maxCrop: Float = .4f,
     val blurBackground: Boolean = false,
     val playbackCategories: String = "",
-)
+    val transitionEffect: SlideEffect = SlideEffect.RANDOM,
+    val focusDurationSeconds: Int = 6,
+) {
+    val effectiveTransitionMillis: Int get() = if (transitionEffect == SlideEffect.NONE) 0 else minOf(transitionMillis, intervalSeconds * 500)
+    val effectiveFocusMillis: Int get() = minOf(focusDurationSeconds, intervalSeconds) * 1000
+}
 
 data class FolderSource(
     val id: String,
@@ -117,6 +158,7 @@ data class LibraryState(
     val preferences: AppPreferences = AppPreferences(),
     val scanningSourceIds: Set<String> = emptySet(),
     val initialized: Boolean = false,
+    val ai: AiSettings = AiSettings(),
 ) {
     fun photosFor(albumId: String): List<Photo> {
         val sourceIds = sources.filter { it.albumId == albumId && it.kind == SourceKind.PHOTO && it.available }.map { it.id }.toSet()
@@ -124,7 +166,7 @@ data class LibraryState(
     }
     fun playbackPhotosFor(album: Album): List<Photo> {
         val selected = album.playbackCategories.split(',').filter { it.isNotBlank() }.toSet()
-        return photosFor(album.id).filter { selected.isEmpty() || it.metadata.category.name in selected }
+        return photosFor(album.id).filter { photo -> selected.isEmpty() || selected.any { name -> PhotoCategory.entries.firstOrNull { it.name == name }?.includes(photo.metadata.category) == true } }
     }
     fun tracksFor(album: Album): List<MusicTrack> {
         if (sources.none { it.id == album.musicSourceId && it.available && it.kind == SourceKind.MUSIC }) return emptyList()
@@ -147,6 +189,13 @@ interface AlbumRepository {
     suspend fun updatePreferences(preferences: AppPreferences)
     suspend fun savePhotoEdits(sourceId: String, photoId: String, focus: FocusPoint?, category: PhotoCategory?, motion: MotionMode?) {}
     suspend fun setAnalysisState(sourceId: String, command: String) {}
+    suspend fun saveAiSettings(settings: AiSettings, apiKey: String?) {}
+    suspend fun aiCommand(command: String, photoId: String? = null) {}
+    suspend fun testAiConnection(): String = "AI 尚未配置"
+    suspend fun setPhotoPresentation(sourceId: String, photoId: String, presentation: String?) {}
+    suspend fun reanalyzePhoto(sourceId: String, photoId: String) {}
+    suspend fun removePhoto(sourceId: String, photoId: String) {}
+    suspend fun restorePhoto(sourceId: String, photoId: String) {}
     suspend fun markUnavailable(sourceId: String, photoId: String) {}
     fun setForeground(value: Boolean) {}
     fun setPlaying(value: Boolean) {}

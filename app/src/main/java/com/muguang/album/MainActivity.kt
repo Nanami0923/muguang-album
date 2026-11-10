@@ -121,6 +121,8 @@ class MainActivity : ComponentActivity() {
                             onMusicVolume = { model.music.setVolume(it) },
                             onSavePhoto = { photo, point, category, motion -> model.savePhoto(photo, point, category, motion) },
                             onFrame = model.repository::reportPlaybackFrame,
+                            onPresentation = { photo, presentation -> model.setPhotoPresentation(photo,presentation) },
+                            onAiRecognize = { model.aiCommand("REANALYZE",it) },
                         ) else MainLibraryScreen(library, albumId, LibraryActions(
                             onSelectAlbum = model::selectAlbum,
                             onCreateAlbum = { model.createAlbum(it) },
@@ -140,6 +142,13 @@ class MainActivity : ComponentActivity() {
                             }, onMessage = model::message,
                             onSavePhoto = { photo, point, category, motion -> model.savePhoto(photo, point, category, motion) },
                             onAnalysisCommand = { id, command -> model.analysisCommand(id, command) },
+                            onSaveAi = { settings, key -> model.saveAiSettings(settings,key) },
+                            onAiCommand = { command, id -> model.aiCommand(command,id) },
+                            onTestAi = { model.testAiConnection() },
+                            onPresentation = { photo, presentation -> model.setPhotoPresentation(photo,presentation) },
+                            onReanalyzePhoto = { model.reanalyzePhoto(it) },
+                            onRemovePhoto = { model.removePhoto(it) },
+                            onRestorePhoto = { model.restorePhoto(it) },
                         ))
                         SnackbarHost(snackbars, Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(16.dp))
                     }

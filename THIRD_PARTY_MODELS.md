@@ -1,6 +1,19 @@
 # 离线模型与第三方组件
 
-所有推理均在本机执行，模型随 APK 捆绑；应用没有网络权限。没有上传照片，也没有人物身份识别。
+本地模型随 APK 捆绑；0.3.0 增加用户自选的视觉 API，默认关闭。启用后待 AI 图片的压缩副本会发往用户配置的服务；没有人物身份识别。
+
+## 0.3.0 新增
+
+| 功能 | 来源与版本 | 本项目采用方式 |
+| --- | --- | --- |
+| 动漫人体 | [DeepGHS](https://huggingface.co/deepghs/anime_person_detection)，revision `e39c744c22432ad01f91dd254fe2b02c8d878b8c`，模型卡 MIT | `person_detect_v1.1_n/model.onnx`，FP32，640 方形补边，RGB/255、NCHW；YOLOv8 单类输出解码及 NMS |
+| 动漫脸 | [DeepGHS](https://huggingface.co/deepghs/anime_face_detection)，revision `784dc4c0bb692351ddcdbe6131a050b17d3025d5`，模型卡 MIT | `face_detect_v1.4_n/model.onnx`，同上，独立脸部阈值 |
+| 显著主体 | [U²-Net](https://github.com/xuebinqin/U-2-Net)，Apache-2.0；[rembg 导出的 ONNX](https://github.com/danielgatis/rembg/blob/main/rembg/sessions/u2netp.py) | 使用固定 rembg release 的 U2NETP 导出，320×320、图像最大值归一化及通道标准化；取第一个融合概率图，不重复 sigmoid |
+| ONNX 推理 | [ONNX Runtime](https://github.com/microsoft/onnxruntime)，MIT | Android 1.22.0，CPU 单线程；保留原有 LiteRT |
+
+新模型 URL、实际 SHA-256、张量契约及桌面冒烟记录见 assets/models 下三个新增 JSON；`scripts/prepare_v030_models.py` 校验固定哈希并可复现获取。U²-Net 许可随资产保存。
+
+动漫预处理明确使用 640×640、底色 114 的等比例居中补边，与上游 imgutils 默认直接缩放策略不同；解码撤销补边。此策略需观察实际图库效果，不把上游指标当作项目准确率。
 
 | 功能 | 来源 | 项目采用方式 |
 | --- | --- | --- |

@@ -31,7 +31,7 @@ class SmartStorageTest {
             old.execSQL("INSERT INTO photos VALUES ('p','s','content://test/p','照片.jpg',123)")
             old.version = 1
         }
-        var database = Room.databaseBuilder(context, AlbumDatabase::class.java, name).addMigrations(SMART_MIGRATION).build()
+        var database = Room.databaseBuilder(context, AlbumDatabase::class.java, name).addMigrations(SMART_MIGRATION, RECOGNITION_MIGRATION, PLAYBACK_MIGRATION).build()
         try {
             var dao = database.dao()
             assertEquals(17, dao.album("a")!!.intervalSeconds)
@@ -39,10 +39,12 @@ class SmartStorageTest {
             val photo = dao.photo("s", "p")!!
             dao.insertPhotos(listOf(photo.copy(metadata = PhotoMetadata(manualX = .8f, manualY = .2f, manualCategory = "ART", taskState = "PROCESSING"))))
             database.close()
-            database = Room.databaseBuilder(context, AlbumDatabase::class.java, name).addMigrations(SMART_MIGRATION).build()
+            database = Room.databaseBuilder(context, AlbumDatabase::class.java, name).addMigrations(SMART_MIGRATION, RECOGNITION_MIGRATION, PLAYBACK_MIGRATION).build()
             dao = database.dao(); dao.recoverAnalysis()
             assertEquals(.8f, dao.photo("s", "p")!!.metadata.manualX)
             assertEquals("QUEUED", dao.photo("s", "p")!!.metadata.taskState)
+            dao.insertPhotos(listOf(photo.copy(id = "removed", trashedAt = 1,
+                unavailableReason = com.muguang.album.core.USER_REMOVED_PHOTO)))
             val now = System.currentTimeMillis()
             dao.trashSource("s", now, "路径失效"); dao.trashSource("s", now + 1000, "重复失效")
             assertEquals(now, dao.photo("s", "p")!!.trashedAt)
@@ -50,6 +52,7 @@ class SmartStorageTest {
             assertNotNull(dao.photo("s", "p"))
             dao.purgeTrash(now)
             assertNull(dao.photo("s", "p"))
+            assertEquals(com.muguang.album.core.USER_REMOVED_PHOTO, dao.photo("s", "removed")!!.unavailableReason)
             assertEquals(30L*86400000, TRASH_RETENTION_MILLIS)
         } finally { database.close(); context.deleteDatabase(name) }
     }

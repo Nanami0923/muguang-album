@@ -1,0 +1,42 @@
+{
+  "source": "https://huggingface.co/deepghs/anime_person_detection/resolve/e39c744c22432ad01f91dd254fe2b02c8d878b8c/person_detect_v1.1_n/model.onnx",
+  "license": "MIT",
+  "sha256": "6fcdfc6af18b3a26aca62aad0e00faffbeea23413abf868808d2d98d399999c9",
+  "bytes": 12102560,
+  "inputs": [
+    {
+      "name": "images",
+      "shape": [
+        "batch",
+        3,
+        "height",
+        "width"
+      ],
+      "type": "tensor(float)"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "output0",
+      "shape": [
+        "batch",
+        "anchors",
+        "Concatoutput0_dim_2"
+      ],
+      "type": "tensor(float)"
+    }
+  ],
+  "metadata": {
+    "stride": "32",
+    "names": "{0: 'person'}"
+  },
+  "smoke_output_shapes": [
+    [
+      1,
+      5,
+      8400
+    ]
+  ],
+  "onnxruntime": "1.22.0",
+  "validation": "CPU zero-input smoke test; not an accuracy evaluation"
+}

@@ -1,6 +1,7 @@
 package com.muguang.album.data
 
 import com.muguang.album.core.PhotoMetadata
+import com.muguang.album.core.USER_REMOVED_PHOTO
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -41,5 +42,17 @@ class IncrementalPhotoIndexTest {
             assertEquals("QUEUED",restored.metadata.taskState)
             assertEquals(cached.manualFocus,restored.metadata.manualFocus)
         }
+    }
+
+    @Test fun userRemovalSurvivesRepeatedScansAndFileChanges() {
+        val removed = photo("p").copy(trashedAt = 1000, unavailableReason = USER_REMOVED_PHOTO)
+        val changed = photo("p").copy(modifiedAt = 30, fileSize = 300)
+        val first = reconcilePhotos(listOf(removed), listOf(changed), 2000).single()
+        assertEquals(1000L, first.trashedAt)
+        assertEquals(USER_REMOVED_PHOTO, first.unavailableReason)
+        val missing = reconcilePhotos(listOf(first), emptyList(), 3000).single()
+        assertEquals(USER_REMOVED_PHOTO, missing.unavailableReason)
+        assertEquals(1000L, missing.trashedAt)
+        assertEquals(cached, missing.metadata)
     }
 }
