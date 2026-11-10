@@ -18,6 +18,8 @@ try {
     if (-not $SkipChecks) { $taskArguments = @(':app:assembleDebug', ':app:testDebugUnitTest', ':app:lintDebug', '--console=plain') }
     & '.\gradlew.bat' @taskArguments
     if ($LASTEXITCODE -ne 0) { throw '构建或检查未通过，请查看上方输出。' }
+    & python (Join-Path $PSScriptRoot 'check_native_alignment.py') (Join-Path $taskRoot 'app\build\outputs\apk\debug\app-debug.apk')
+    if ($LASTEXITCODE -ne 0) { throw '安装包未通过 16 KB 原生库对齐检查。' }
     New-Item -ItemType Directory -Path (Join-Path $taskRoot 'dist') -Force | Out-Null
     $taskMetadata = Get-Content -LiteralPath (Join-Path $taskRoot 'app\build\outputs\apk\debug\output-metadata.json') -Raw | ConvertFrom-Json
     $taskVersion = [string]$taskMetadata.elements[0].versionName

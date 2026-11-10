@@ -1,0 +1,70 @@
+{
+  "source": "https://storage.googleapis.com/download.tensorflow.org/models/tflite/task_library/object_detection/android/lite-model_efficientdet_lite0_detection_metadata_1.tflite",
+  "sha256": "2e04c53bfeac0ac2a30c057c7e2a777594ce39baaac35a92f74fb1e8c4fc4e0b",
+  "input": [
+    {
+      "name": "serving_default_images:0",
+      "shape": [
+        1,
+        320,
+        320,
+        3
+      ],
+      "dtype": "<class 'numpy.uint8'>",
+      "quantization": [
+        0.0078125,
+        127
+      ]
+    }
+  ],
+  "outputs": [
+    {
+      "name": "StatefulPartitionedCall:3",
+      "shape": [
+        1,
+        25,
+        4
+      ],
+      "dtype": "<class 'numpy.float32'>",
+      "quantization": [
+        0.0,
+        0
+      ]
+    },
+    {
+      "name": "StatefulPartitionedCall:2",
+      "shape": [
+        1,
+        25
+      ],
+      "dtype": "<class 'numpy.float32'>",
+      "quantization": [
+        0.0,
+        0
+      ]
+    },
+    {
+      "name": "StatefulPartitionedCall:1",
+      "shape": [
+        1,
+        25
+      ],
+      "dtype": "<class 'numpy.float32'>",
+      "quantization": [
+        0.0,
+        0
+      ]
+    },
+    {
+      "name": "StatefulPartitionedCall:0",
+      "shape": [
+        1
+      ],
+      "dtype": "<class 'numpy.float32'>",
+      "quantization": [
+        0.0,
+        0
+      ]
+    }
+  ]
+}

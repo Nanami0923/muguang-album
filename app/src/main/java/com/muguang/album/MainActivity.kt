@@ -119,6 +119,8 @@ class MainActivity : ComponentActivity() {
                             onSleep = model::setSleepMinutes, onMusicPause = model::toggleMusic,
                             onMusicPrevious = { model.music.previous() }, onMusicNext = { model.music.next() },
                             onMusicVolume = { model.music.setVolume(it) },
+                            onSavePhoto = { photo, point, category, motion -> model.savePhoto(photo, point, category, motion) },
+                            onFrame = model.repository::reportPlaybackFrame,
                         ) else MainLibraryScreen(library, albumId, LibraryActions(
                             onSelectAlbum = model::selectAlbum,
                             onCreateAlbum = { model.createAlbum(it) },
@@ -136,6 +138,8 @@ class MainActivity : ComponentActivity() {
                                 if (it.remindersEnabled && !library.preferences.remindersEnabled && Build.VERSION.SDK_INT >= 33) notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
                                 model.updatePreferences(it)
                             }, onMessage = model::message,
+                            onSavePhoto = { photo, point, category, motion -> model.savePhoto(photo, point, category, motion) },
+                            onAnalysisCommand = { id, command -> model.analysisCommand(id, command) },
                         ))
                         SnackbarHost(snackbars, Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(16.dp))
                     }

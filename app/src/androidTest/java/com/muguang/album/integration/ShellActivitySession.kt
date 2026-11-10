@@ -35,9 +35,10 @@ class ShellActivitySession private constructor(private var activity: MainActivit
 
     companion object {
         fun launch(): ShellActivitySession {
+            val targetPackage = InstrumentationRegistry.getInstrumentation().targetContext.packageName
             val output = runShell(
                 "am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER " +
-                    "-n com.muguang.album/.MainActivity",
+                    "-n $targetPackage/com.muguang.album.MainActivity",
             )
             return try {
                 ShellActivitySession(awaitResumedActivity())
@@ -49,8 +50,9 @@ class ShellActivitySession private constructor(private var activity: MainActivit
         /** Only starts the instrumentation APK's own no-display fixture-grant activity. */
         fun grantSyntheticFolders(revoke: Boolean = false) {
             val testPackage = InstrumentationRegistry.getInstrumentation().context.packageName
+            val targetPackage = InstrumentationRegistry.getInstrumentation().targetContext.packageName
             runShell(
-                "am start -n $testPackage/${SyntheticGrantActivity::class.java.name} --ez revoke $revoke",
+                "am start -n $testPackage/${SyntheticGrantActivity::class.java.name} --ez revoke $revoke --es targetPackage $targetPackage",
             )
         }
 

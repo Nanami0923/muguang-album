@@ -16,6 +16,7 @@ import com.muguang.album.core.LibraryState
 import com.muguang.album.core.MusicOrder
 import com.muguang.album.core.MusicTrack
 import com.muguang.album.core.PlaySchedule
+import com.muguang.album.core.Photo
 import com.muguang.album.core.SourceKind
 import org.junit.Assert.*
 import org.junit.Rule
@@ -28,10 +29,44 @@ class LibraryScreenTest {
 
     private val album = Album(id = "family", name = "家庭相册")
 
+    @Test fun previewLayoutSwitchesBetweenOneAndTwoColumns() {
+        val source=FolderSource("photos",album.id,"content://test/photos","测试照片",SourceKind.PHOTO)
+        val photos=(1..20).map { Photo("photo-$it",source.id,"content://test/photo-$it","照片$it.jpg") }
+        val recorder=show(LibraryState(albums=listOf(album),sources=listOf(source),photos=photos,initialized=true))
+        val grid=compose.onNodeWithTag("photo-library-grid")
+        grid.performScrollToIndex(4)
+        compose.onNodeWithTag("gallery-columns-1").performClick()
+        compose.runOnIdle { assertEquals(1,recorder.latestPreferences!!.galleryColumns) }
+        grid.performScrollToIndex(5)
+        val firstSingle=compose.onNodeWithTag("photo-tile-photo-1").getUnclippedBoundsInRoot()
+        val secondSingle=compose.onNodeWithTag("photo-tile-photo-2").getUnclippedBoundsInRoot()
+        assertEquals(firstSingle.left.value,secondSingle.left.value,.1f)
+        assertTrue(secondSingle.top>firstSingle.top)
+        grid.performScrollToIndex(4)
+        compose.onNodeWithTag("gallery-columns-2").performClick()
+        compose.runOnIdle { assertEquals(2,recorder.latestPreferences!!.galleryColumns) }
+        grid.performScrollToIndex(5)
+        val firstDouble=compose.onNodeWithTag("photo-tile-photo-1").getUnclippedBoundsInRoot()
+        val secondDouble=compose.onNodeWithTag("photo-tile-photo-2").getUnclippedBoundsInRoot()
+        assertEquals(firstDouble.top.value,secondDouble.top.value,.1f)
+        assertTrue(secondDouble.left>firstDouble.left)
+    }
+
+    @Test fun scrollingPhotosMovesThePlaybackCardOffScreen() {
+        val source = FolderSource("photos",album.id,"content://test/photos","测试照片",SourceKind.PHOTO)
+        val photos = (1..80).map { Photo("photo-$it",source.id,"content://test/photo-$it","照片$it.jpg") }
+        show(LibraryState(albums=listOf(album),sources=listOf(source),photos=photos,initialized=true))
+        compose.onNodeWithText("开始播放").assertIsDisplayed()
+        compose.onNodeWithTag("photo-library-grid").performScrollToIndex(40)
+        compose.onNodeWithText("开始播放").assertDoesNotExist()
+        compose.onNodeWithTag("photo-library-grid").assertIsDisplayed()
+    }
+
     @Test
     fun emptyGalleryCanChooseTheCurrentAlbumsFolderInANarrowWindow() {
         val recorder = show(LibraryState(albums = listOf(album), initialized = true))
 
+        compose.onNodeWithTag("photo-library-grid").performScrollToIndex(5)
         compose.onNodeWithText("从一个文件夹开始").assertExists()
         compose.onNodeWithText("选择图片文件夹").performScrollTo().performClick()
 

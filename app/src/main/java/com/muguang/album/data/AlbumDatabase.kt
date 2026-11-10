@@ -3,6 +3,7 @@ package com.muguang.album.data
 import androidx.room.Dao
 import androidx.room.Database
 import androidx.room.Entity
+import androidx.room.Embedded
 import androidx.room.ForeignKey
 import androidx.room.Index
 import androidx.room.Insert
@@ -26,6 +27,9 @@ internal data class AlbumEntity(
     val musicEnabled: Boolean,
     val musicOrder: String,
     val musicVolume: Float,
+    val motionMode: String = "OFF", val motionStrength: Float = .12f,
+    val maxCrop: Float = .4f, val blurBackground: Boolean = false,
+    val playbackCategories: String = "",
 )
 
 @Entity(
@@ -48,6 +52,7 @@ internal data class SourceEntity(
     val available: Boolean,
     val error: String?,
     val lastScanAt: Long,
+    val analysisState: String = "RUNNING",
 )
 
 @Entity(
@@ -59,7 +64,7 @@ internal data class SourceEntity(
         childColumns = ["sourceId"],
         onDelete = ForeignKey.CASCADE,
     )],
-    indices = [Index("sourceId")],
+    indices = [Index("sourceId"), Index(value = ["analysis_taskState", "trashedAt", "sourceId"])],
 )
 internal data class PhotoEntity(
     val id: String,
@@ -67,6 +72,10 @@ internal data class PhotoEntity(
     val uri: String,
     val name: String,
     val modifiedAt: Long,
+    val fileSize: Long = 0,
+    val trashedAt: Long? = null,
+    val unavailableReason: String? = null,
+    @Embedded(prefix = "analysis_") val metadata: com.muguang.album.core.PhotoMetadata = com.muguang.album.core.PhotoMetadata(),
 )
 
 @Entity(
@@ -110,6 +119,32 @@ internal data class ScheduleEntity(
 
 @Dao
 internal interface AlbumDao {
+    @Query("SELECT * FROM photos WHERE id = :id")
+    suspend fun photosById(id: String): List<PhotoEntity>
+    @Query("SELECT * FROM photos WHERE sourceId = :sourceId")
+    suspend fun sourcePhotos(sourceId: String): List<PhotoEntity>
+
+    @Query("SELECT * FROM photos WHERE sourceId = :sourceId AND id = :id")
+    suspend fun photo(sourceId: String, id: String): PhotoEntity?
+
+    @Query("SELECT photos.* FROM photos INNER JOIN sources ON sources.id = photos.sourceId WHERE photos.trashedAt IS NULL AND sources.available = 1 AND sources.analysisState = 'RUNNING' AND photos.analysis_taskState = 'QUEUED' LIMIT 1")
+    suspend fun nextAnalysis(): PhotoEntity?
+
+    @Query("UPDATE photos SET analysis_taskState = 'QUEUED' WHERE analysis_taskState = 'PROCESSING'")
+    suspend fun recoverAnalysis()
+
+    @Query("UPDATE sources SET analysisState = :state WHERE id = :id")
+    suspend fun analysisState(id: String, state: String)
+
+    @Query("UPDATE photos SET trashedAt = COALESCE(trashedAt, :now), unavailableReason = :reason WHERE sourceId = :sourceId")
+    suspend fun trashSource(sourceId: String, now: Long, reason: String)
+
+    @Query("DELETE FROM photos WHERE trashedAt IS NOT NULL AND trashedAt <= :cutoff")
+    suspend fun purgeTrash(cutoff: Long)
+
+    @Query("UPDATE albums SET motionMode = :mode, motionStrength = :strength, maxCrop = :crop, blurBackground = :blur, playbackCategories = :categories WHERE id = :id")
+    suspend fun smartSettings(id: String, mode: String, strength: Float, crop: Float, blur: Boolean, categories: String)
+
     @Query("SELECT * FROM albums ORDER BY rowid")
     fun observeAlbums(): Flow<List<AlbumEntity>>
 
@@ -209,7 +244,7 @@ internal interface AlbumDao {
 
 @Database(
     entities = [AlbumEntity::class, SourceEntity::class, PhotoEntity::class, TrackEntity::class, ScheduleEntity::class],
-    version = 1,
+    version = 2,
     exportSchema = true,
 )
 internal abstract class AlbumDatabase : RoomDatabase() {

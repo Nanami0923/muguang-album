@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
@@ -63,6 +64,8 @@ data class LibraryActions(
     val onDeleteSchedule: (String) -> Unit,
     val onUpdatePreferences: (AppPreferences) -> Unit,
     val onMessage: (String) -> Unit,
+    val onSavePhoto: (Photo, FocusPoint?, PhotoCategory?, MotionMode?) -> Unit = { _, _, _, _ -> },
+    val onAnalysisCommand: (String, String) -> Unit = { _, _ -> },
 )
 
 private enum class Destination(val title: String, val icon: ImageVector) {
@@ -148,7 +151,12 @@ private fun AlbumPage(library: LibraryState, album: Album?, actions: LibraryActi
     var musicDialog by rememberSaveable { mutableStateOf(false) }
     var sourceDialog by rememberSaveable { mutableStateOf(false) }
     var deleteDialog by rememberSaveable { mutableStateOf(false) }
-    var preview by remember { mutableStateOf<Photo?>(null) }
+    var previewId by rememberSaveable { mutableStateOf<String?>(null) }
+    var previewSourceId by rememberSaveable { mutableStateOf<String?>(null) }
+    val preview = library.photos.find { it.id == previewId && it.sourceId == previewSourceId }
+    var categoryFilter by remember { mutableStateOf<PhotoCategory?>(null) }
+    var issueFilter by remember { mutableStateOf("全部") }
+    var trashDialog by remember { mutableStateOf(false) }
     val photos = remember(library.photos, library.sources, album?.id, album?.sortOrder) {
         album?.let { item ->
             val list = library.photosFor(item.id)
@@ -157,66 +165,96 @@ private fun AlbumPage(library: LibraryState, album: Album?, actions: LibraryActi
         } ?: emptyList()
     }
     val sources = library.sources.filter { it.albumId == album?.id && it.kind == SourceKind.PHOTO }
+    val visiblePhotos = photos.filter { (categoryFilter == null || it.metadata.category == categoryFilter) && when (issueFilter) {
+        "待手动选点" -> it.metadata.manualFocus == null && it.metadata.focusStatus == "NEEDS_MANUAL"
+        "技术错误" -> it.metadata.taskState == "FAILED"
+        else -> true
+    } }
     val scanning = sources.any { it.id in library.scanningSourceIds }
     val padding = if (wide) 28.dp else 20.dp
-    Column(Modifier.fillMaxSize().padding(horizontal = padding).padding(top = 24.dp)) {
-        PageHeading("暮光相册", "把喜欢的日常，留在眼前。") {
-            IconButton(onClick = { createDialog = true }) { Icon(Icons.Outlined.Add, "新建相册") }
-        }
-        Spacer(Modifier.height(20.dp))
-        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp), contentPadding = PaddingValues(bottom = 16.dp)) {
-            items(library.albums, key = { it.id }) { item ->
-                FilterChip(
-                    selected = album?.id == item.id,
-                    onClick = { actions.onSelectAlbum(item.id) },
-                    label = { Text(item.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                    leadingIcon = if (album?.id == item.id) ({ Icon(Icons.Outlined.Check, null, Modifier.size(16.dp)) }) else null,
-                )
-            }
-        }
+    Column(Modifier.fillMaxSize().padding(horizontal = padding)) {
         if (album == null) {
+            Spacer(Modifier.height(24.dp))
+            PageHeading("暮光相册", "把喜欢的日常，留在眼前。") {
+                IconButton(onClick = { createDialog = true }) { Icon(Icons.Outlined.Add, "新建相册") }
+            }
             EmptyState(Icons.Outlined.Collections, "创建第一本相册", "为家中的回忆起个名字，再选择照片文件夹。", Modifier.weight(1f), scrollable = true) {
                 Button(onClick = { createDialog = true }) { Icon(Icons.Outlined.Add, null); Spacer(Modifier.width(8.dp)); Text("新建相册") }
             }
         } else {
             Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(24.dp)) {
-                Column(Modifier.weight(1f).fillMaxHeight()) {
-                    AlbumSummary(album, photos, sources.size, scanning, onPlay = { actions.onPlay(album.id) }, onSettings = { settingsDialog = true })
-                    Row(Modifier.fillMaxWidth().padding(top = 20.dp, bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text("全部照片", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
-                        if (scanning) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
-                        if (!wide) {
-                            IconButton(onClick = { sourceDialog = true }) { Icon(Icons.Outlined.FolderOpen, "管理图片文件夹") }
-                            IconButton(onClick = { musicDialog = true }) { Icon(Icons.Outlined.MusicNote, "背景音乐") }
-                        }
-                        IconButton(onClick = { actions.onPickPhotos(album.id) }) { Icon(Icons.Outlined.CreateNewFolder, "添加图片文件夹") }
-                    }
-                    if (photos.isEmpty()) {
-                        EmptyState(
-                            Icons.Outlined.AddPhotoAlternate,
-                            if (scanning) "正在发现照片" else "从一个文件夹开始",
-                            if (scanning) "照片会陆续出现在这里，可以继续操作。" else "选择平板或存储卡中的图片文件夹。\n原图会一直留在原处。",
-                            Modifier.weight(1f),
-                            scrollable = true,
-                        ) {
-                            Button(onClick = { actions.onPickPhotos(album.id) }, enabled = !scanning) {
-                                Icon(Icons.Outlined.FolderOpen, null, Modifier.size(19.dp)); Spacer(Modifier.width(8.dp)); Text("选择图片文件夹")
+                key(album.id) {
+                    LazyVerticalGrid(
+                        columns = GridCells.Fixed(library.preferences.galleryColumns.coerceIn(1, 2)),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                        contentPadding = PaddingValues(top = 24.dp, bottom = 24.dp),
+                        modifier = Modifier.weight(1f).fillMaxHeight().testTag("photo-library-grid"),
+                    ) {
+                        item(key = "heading", span = { GridItemSpan(maxLineSpan) }) {
+                            PageHeading("暮光相册", "把喜欢的日常，留在眼前。") {
+                                IconButton(onClick = { createDialog = true }) { Icon(Icons.Outlined.Add, "新建相册") }
                             }
                         }
-                    } else {
-                        LazyVerticalGrid(
-                            columns = GridCells.Adaptive(140.dp),
-                            horizontalArrangement = Arrangement.spacedBy(12.dp),
-                            verticalArrangement = Arrangement.spacedBy(12.dp),
-                            contentPadding = PaddingValues(bottom = 24.dp),
-                            modifier = Modifier.weight(1f),
-                        ) {
-                            items(photos, key = { it.id }) { photo -> PhotoTile(photo) { preview = photo } }
+                        item(key = "albums", span = { GridItemSpan(maxLineSpan) }) {
+                            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                items(library.albums, key = { it.id }) { item ->
+                                    FilterChip(
+                                        selected = album.id == item.id,
+                                        onClick = { actions.onSelectAlbum(item.id) },
+                                        label = { Text(item.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                                        leadingIcon = if (album.id == item.id) ({ Icon(Icons.Outlined.Check, null, Modifier.size(16.dp)) }) else null,
+                                    )
+                                }
+                            }
+                        }
+                        item(key = "summary", span = { GridItemSpan(maxLineSpan) }) {
+                            AlbumSummary(album, photos, sources.size, scanning, onPlay = { actions.onPlay(album.id) }, onSettings = { settingsDialog = true })
+                        }
+                        item(key = "photo-actions", span = { GridItemSpan(maxLineSpan) }) {
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                Text("全部照片", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                                if (scanning) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                                if (!wide) {
+                                    IconButton(onClick = { sourceDialog = true }) { Icon(Icons.Outlined.FolderOpen, "管理图片文件夹") }
+                                    IconButton(onClick = { musicDialog = true }) { Icon(Icons.Outlined.MusicNote, "背景音乐") }
+                                }
+                                IconButton(onClick = { actions.onPickPhotos(album.id) }) { Icon(Icons.Outlined.CreateNewFolder, "添加图片文件夹") }
+                            }
+                        }
+                        item(key = "filters", span = { GridItemSpan(maxLineSpan) }) {
+                            Column {
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    Text("预览布局", style = MaterialTheme.typography.labelMedium)
+                                    listOf(1 to "单列", 2 to "双列").forEach { (count, label) ->
+                                        FilterChip(library.preferences.galleryColumns == count,
+                                            { actions.onUpdatePreferences(library.preferences.copy(galleryColumns = count)) },
+                                            label = { Text(label) }, modifier = Modifier.testTag("gallery-columns-$count"))
+                                    }
+                                }
+                                LibraryFilterBar(categoryFilter, { categoryFilter = it }, issueFilter, { issueFilter = it }, { trashDialog = true })
+                            }
+                        }
+                        if (visiblePhotos.isEmpty()) {
+                            item(key = "empty", span = { GridItemSpan(maxLineSpan) }) {
+                                EmptyState(
+                                    Icons.Outlined.AddPhotoAlternate,
+                                    if (photos.isNotEmpty()) "没有符合筛选的照片" else if (scanning) "正在发现照片" else "从一个文件夹开始",
+                                    if (photos.isNotEmpty()) "可切换类别或问题筛选查看其他照片。" else if (scanning) "照片会陆续出现在这里，可以继续操作。" else "选择平板或存储卡中的图片文件夹。\n原图会一直留在原处。",
+                                    Modifier.fillMaxWidth().heightIn(min = 280.dp),
+                                ) {
+                                    if (photos.isEmpty()) Button(onClick = { actions.onPickPhotos(album.id) }, enabled = !scanning) {
+                                        Icon(Icons.Outlined.FolderOpen, null, Modifier.size(19.dp)); Spacer(Modifier.width(8.dp)); Text("选择图片文件夹")
+                                    }
+                                }
+                            }
+                        } else {
+                            items(visiblePhotos, key = { "photo:${it.id}" }) { photo -> PhotoTile(photo) { previewId = photo.id; previewSourceId = photo.sourceId } }
                         }
                     }
                 }
                 if (wide) {
-                    Column(Modifier.width(290.dp).fillMaxHeight().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                    Column(Modifier.width(290.dp).fillMaxHeight().padding(top = 24.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(16.dp)) {
                         SidePanel("图片来源", Icons.Outlined.FolderOpen, action = { actions.onPickPhotos(album.id) }) {
                             if (sources.isEmpty()) Text("还没有添加图片文件夹", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             sources.forEach { source -> SourceRow(source, library, actions) }
@@ -243,7 +281,11 @@ private fun AlbumPage(library: LibraryState, album: Album?, actions: LibraryActi
             if (deleteDialog) ConfirmDelete("移除“${album.name}”？", "相册内的原图和音乐不会被删除，相关播放计划将停用。", { deleteDialog = false }) {
                 actions.onDeleteAlbum(album.id); deleteDialog = false
             }
-            preview?.let { photo -> PhotoPreview(photo, onDismiss = { preview = null }, onPlay = { preview = null; actions.onPlay(album.id) }) }
+            preview?.let { original ->
+                val photo = library.photos.find { it.id == original.id && it.sourceId == original.sourceId } ?: original
+                FocusEditor(photo, album, onDismiss = { previewId = null }) { point, category, motion -> actions.onSavePhoto(photo, point, category, motion); previewId = null }
+            }
+            if (trashDialog) TrashDialog(library.photos.filter { p -> p.trashedAt != null && sources.any { it.id == p.sourceId } }, { trashDialog = false }) { actions.onRefreshSource(it) }
         }
     }
     if (createDialog) {
@@ -288,8 +330,11 @@ private fun AlbumSummary(album: Album, photos: List<Photo>, sourceCount: Int, sc
 
 @Composable
 private fun PhotoTile(photo: Photo, onClick: () -> Unit) {
-    Box(Modifier.fillMaxWidth().aspectRatio(1f).clip(RoundedCornerShape(16.dp)).background(MaterialTheme.colorScheme.surfaceContainer).clickable(onClick = onClick)) {
+    Box(Modifier.fillMaxWidth().aspectRatio(1f).testTag("photo-tile-${photo.id}").clip(RoundedCornerShape(16.dp)).background(MaterialTheme.colorScheme.surfaceContainer).clickable(onClick = onClick)) {
         AsyncImage(photo.uri, photo.name, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+        Surface(Modifier.align(Alignment.TopEnd).padding(6.dp), color = Color.Black.copy(alpha = .65f), shape = RoundedCornerShape(6.dp)) {
+            Text(photo.metadata.displayStatus, Modifier.padding(4.dp), color = Color.White, style = MaterialTheme.typography.labelSmall)
+        }
         Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(50.dp).background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = .52f)))))
         Text(photo.name, Modifier.align(Alignment.BottomStart).padding(10.dp), style = MaterialTheme.typography.labelSmall, color = Color.White, maxLines = 1, overflow = TextOverflow.Ellipsis)
     }
@@ -319,6 +364,7 @@ private fun SourceRow(source: FolderSource, library: LibraryState, actions: Libr
                 else actions.onPickMusic(source.albumId)
             }) { Text("重新选择文件夹") }
         }
+        if (source.kind == SourceKind.PHOTO) AnalysisControls(source, library.photos.filter { it.sourceId == source.id && it.trashedAt == null }, actions.onAnalysisCommand)
     }
     if (confirmRemove) ConfirmDelete("移除此文件夹？", "只会解除此相册的引用，不会删除平板上的文件。", { confirmRemove = false }) { actions.onRemoveSource(source.id); confirmRemove = false }
 }
@@ -415,6 +461,7 @@ private fun AlbumSettingsDialog(album: Album, onDismiss: () -> Unit, onSave: (Al
             FilterChip(draft.scale == PhotoScale.CROP, { draft = draft.copy(scale = PhotoScale.CROP) }, label = { Text("填满裁切") })
         }
         ToggleRow("淡入淡出", "关闭后直接切换，更适合较旧的平板", draft.transitionMillis > 0, { draft = draft.copy(transitionMillis = if (it) 500 else 0) })
+        SmartPlaybackSettings(draft) { draft = it }
         Button(onClick = {
             val seconds = interval.toIntOrNull()
             if (seconds != null && seconds in 1..3600 && draft.name.isNotBlank()) { onSave(draft.copy(intervalSeconds = seconds, name = draft.name.trim())); onDismiss() }

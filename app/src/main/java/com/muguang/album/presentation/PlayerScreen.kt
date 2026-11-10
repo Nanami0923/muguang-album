@@ -19,6 +19,7 @@ import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -44,6 +45,8 @@ import coil3.request.ImageRequest
 import com.muguang.album.PlayerSession
 import com.muguang.album.core.LibraryState
 import com.muguang.album.core.PhotoScale
+import com.muguang.album.core.*
+import com.muguang.album.ui.FocusEditor
 import com.muguang.album.playback.MusicState
 import com.muguang.album.playback.ScheduleCalculator
 import java.time.Instant
@@ -60,7 +63,11 @@ fun PlayerScreen(
     onReady: (Long, String) -> Unit, onImageError: (Long, String) -> Unit,
     onSleep: (Int?) -> Unit, onMusicPause: () -> Unit,
     onMusicPrevious: () -> Unit, onMusicNext: () -> Unit, onMusicVolume: (Float) -> Unit,
+    onSavePhoto: (Photo, FocusPoint?, PhotoCategory?, MotionMode?) -> Unit = { _, _, _, _ -> },
+    onFrame: (Long) -> Unit = {},
 ) {
+    var editing by rememberSaveable { mutableStateOf(false) }
+    var resumeAfterEdit by rememberSaveable { mutableStateOf(false) }
     var controls by remember { mutableStateOf(true) }
     var sleepDialog by remember { mutableStateOf(false) }
     var musicDialog by remember { mutableStateOf(false) }
@@ -90,7 +97,7 @@ fun PlayerScreen(
             interact()
         }) { change, amount -> change.consume(); drag += amount }
     }) {
-        if (session != null) PhotoCanvas(session, onReady, onImageError)
+        if (session != null) PhotoCanvas(session, onReady, onImageError, onFrame)
         else {
             val next = library.schedules.filter { it.enabled }.mapNotNull { ScheduleCalculator.upcoming(it, now, count = 1).firstOrNull() }.minByOrNull { it.start }
             Column(Modifier.align(Alignment.Center).padding(32.dp).widthIn(max = 560.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(20.dp)) {
@@ -112,6 +119,7 @@ fun PlayerScreen(
                         Text(if (session.occurrenceKey == null) "手动播放" else "跟随播放计划", color = Color.White.copy(.6f), style = MaterialTheme.typography.labelMedium)
                     }
                     Text("${session.index + 1} / ${session.photos.size}", color = Color.White.copy(.8f))
+                    IconButton(onClick = { resumeAfterEdit = !session.paused; if (!session.paused) onPause(); editing = true }) { Icon(Icons.Rounded.MyLocation, "设置当前照片焦点", tint = Color.White) }
                     IconButton(onClick = onStop) { Icon(Icons.Rounded.Stop, "停止当前会话", tint = Color.White) }
                 }
             }
@@ -135,6 +143,12 @@ fun PlayerScreen(
                     }
                 }
             }
+        }
+    }
+    if (editing && session != null) {
+        fun closeEditor() { editing = false; if (resumeAfterEdit && session.paused) onPause(); resumeAfterEdit = false }
+        FocusEditor(session.photo, session.album, ::closeEditor) { point, category, motion ->
+            onSavePhoto(session.photo, point, category, motion); closeEditor()
         }
     }
     if (sleepDialog) SleepDialog(sleepRemaining, onDismiss = { sleepDialog = false }, onSet = { onSleep(it); sleepDialog = false })
@@ -161,7 +175,7 @@ fun PlayerScreen(
 }
 
 @Composable
-private fun PhotoCanvas(session: PlayerSession, onReady: (Long, String) -> Unit, onError: (Long, String) -> Unit) {
+private fun PhotoCanvas(session: PlayerSession, onReady: (Long, String) -> Unit, onError: (Long, String) -> Unit, onFrame: (Long) -> Unit) {
     var stable by remember { mutableStateOf<Painter?>(null) }
     var previous by remember { mutableStateOf<Painter?>(null) }
     val alpha = remember { Animatable(1f) }
@@ -177,9 +191,13 @@ private fun PhotoCanvas(session: PlayerSession, onReady: (Long, String) -> Unit,
         val cap = if (memory <= 128) 1920 else 3072
         val factor = (cap.toFloat() / maxOf(width, height)).coerceAtMost(1f)
         previous?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = scale) }
-        stable?.let { Image(it, session.photo.name, Modifier.fillMaxSize().alpha(alpha.value), contentScale = scale) }
+        stable?.let { painter ->
+            val mode = session.photo.metadata.customMotionMode ?: session.album.motionMode.name
+            if (mode == MotionMode.OFF.name) Image(painter, session.photo.name, Modifier.fillMaxSize().alpha(alpha.value), contentScale = scale)
+            else MotionPicture(painter, session.photo, session.album, session.paused || !session.ready, session.token to session.motionCycle, Modifier.alpha(alpha.value), onFrame)
+        }
         if (stable == null) CircularProgressIndicator(Modifier.align(Alignment.Center))
-        key(session.token, session.photo.uri) {
+        key(session.token, session.photo.uri, session.photo.modifiedAt, session.photo.fileSize) {
             LoadPhoto(session.photo.uri, (width * factor).toInt(), (height * factor).toInt(), onLoaded = { painter ->
                 previous = stable
                 stable = painter

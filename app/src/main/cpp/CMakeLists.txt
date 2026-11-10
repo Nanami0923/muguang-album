@@ -1,0 +1,11 @@
+cmake_minimum_required(VERSION 3.22.1)
+project(album_analysis)
+set(CMAKE_CXX_STANDARD 17)
+add_library(album_faces SHARED faces_jni.cpp vendor/libfacedetection/facedetectcnn.cpp
+    vendor/libfacedetection/facedetectcnn-model.cpp vendor/libfacedetection/facedetectcnn-data.cpp)
+target_include_directories(album_faces PRIVATE vendor/libfacedetection)
+target_compile_options(album_faces PRIVATE -O3)
+if(ANDROID_ABI MATCHES "arm64-v8a|armeabi-v7a")
+    target_compile_definitions(album_faces PRIVATE _ENABLE_NEON)
+endif()
+target_link_options(album_faces PRIVATE "-Wl,-z,max-page-size=16384")

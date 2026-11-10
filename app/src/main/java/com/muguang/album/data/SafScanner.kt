@@ -25,7 +25,7 @@ internal class SafScanner(private val resolver: ContentResolver) {
             DocumentsContract.Document.COLUMN_MIME_TYPE,
         ), null, null, null) ?: throw IllegalStateException("暂时无法读取文件夹，请检查存储设备是否已连接")
         return cursor.use {
-            check(it.moveToFirst()) { "文件夹不存在或存储设备未连接" }
+            if (!it.moveToFirst()) throw java.io.FileNotFoundException("文件夹不存在或存储设备未连接")
             val mime = it.text(DocumentsContract.Document.COLUMN_MIME_TYPE)
             check(mime == DocumentsContract.Document.MIME_TYPE_DIR) { "请选择文件夹，不是单个文件" }
             it.text(DocumentsContract.Document.COLUMN_DISPLAY_NAME).ifBlank { "本地文件夹" }
@@ -56,6 +56,7 @@ internal class SafScanner(private val resolver: ContentResolver) {
                 val nameColumn = it.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
                 val mimeColumn = it.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
                 val modifiedColumn = it.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+                val sizeColumn = it.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
                 while (it.moveToNext()) {
                     context.ensureActive()
                     val documentId = it.getString(idColumn) ?: continue
@@ -78,6 +79,7 @@ internal class SafScanner(private val resolver: ContentResolver) {
                             uri = uri,
                             name = name.ifBlank { "未命名图片" },
                             modifiedAt = if (modifiedColumn >= 0 && !it.isNull(modifiedColumn)) it.getLong(modifiedColumn) else 0L,
+                            fileSize = if (sizeColumn >= 0 && !it.isNull(sizeColumn)) it.getLong(sizeColumn) else 0L,
                         )
                     } else {
                         tracks += TrackEntity(stableId, source.id, uri, name.ifBlank { "未命名音乐" })
@@ -100,6 +102,7 @@ internal class SafScanner(private val resolver: ContentResolver) {
             DocumentsContract.Document.COLUMN_DISPLAY_NAME,
             DocumentsContract.Document.COLUMN_MIME_TYPE,
             DocumentsContract.Document.COLUMN_LAST_MODIFIED,
+            DocumentsContract.Document.COLUMN_SIZE,
         )
         private val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "webp", "gif", "bmp", "heif", "heic", "avif")
         private val AUDIO_EXTENSIONS = setOf("mp3", "m4a", "aac", "wav", "ogg", "flac", "opus")

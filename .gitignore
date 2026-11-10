@@ -29,3 +29,7 @@ signing.properties
 !artifacts/device-tests-ui-recheck.log
 Thumbs.db
 .DS_Store
+.model-env/
+.cxx/
+**/.cxx/
+model-work/

@@ -26,6 +26,7 @@ data class PlayerSession(
     val pauseReason: PauseReason? = null,
     val ready: Boolean = false,
     val occurrenceKey: String? = null,
+    val motionCycle: Long = 0,
 ) {
     val photo: Photo get() = photos[index.coerceIn(photos.indices)]
 }
@@ -59,6 +60,15 @@ class AlbumViewModel(application: Application) : AndroidViewModel(application) {
                 if (state.initialized && state.albums.none { it.id == _selectedAlbumId.value }) {
                     _selectedAlbumId.value = state.albums.firstOrNull()?.id
                 }
+                val current = _session.value
+                if (current != null) {
+                    val available = state.playbackPhotosFor(current.album).associateBy { it.id }
+                    val latest = available[current.photo.id]
+                    if (latest != null && latest != current.photo) {
+                        _session.value = current.copy(photos = current.photos.map { available[it.id] ?: it })
+                    }
+                    if (latest == null && state.initialized) advance(1, automatic = false)
+                }
             }
         }
         viewModelScope.launch {
@@ -89,6 +99,10 @@ class AlbumViewModel(application: Application) : AndroidViewModel(application) {
         repository.addSource(albumId, uri, kind, recursive = kind == SourceKind.PHOTO)
     }
     fun scanSource(id: String) = launchOperation { repository.scan(id) }
+    fun analysisCommand(id: String, command: String) = launchOperation { repository.setAnalysisState(id, command) }
+    fun savePhoto(photo: Photo, point: FocusPoint?, category: PhotoCategory?, motion: MotionMode?) = launchOperation {
+        repository.savePhotoEdits(photo.sourceId, photo.id, point, category, motion)
+    }
     fun removeSource(id: String) = launchOperation { repository.removeSource(id) }
     fun updateSource(id: String, recursive: Boolean) = launchOperation {
         repository.updateSource(id, recursive)
@@ -126,7 +140,7 @@ class AlbumViewModel(application: Application) : AndroidViewModel(application) {
             val order = if (album.sortOrder == SortOrder.MODIFIED) a.modifiedAt.compareTo(b.modifiedAt) else 0
             if (order != 0) order else compareNaturally(a.name, b.name).takeIf { it != 0 } ?: a.id.compareTo(b.id)
         }
-        return library.value.photosFor(album.id).sortedWith(comparator)
+        return library.value.playbackPhotosFor(album).sortedWith(comparator)
     }
 
     private fun start(album: Album, occurrenceKey: String?) {
@@ -142,6 +156,7 @@ class AlbumViewModel(application: Application) : AndroidViewModel(application) {
         dwellDeadline = null
         dwellRemaining = album.intervalSeconds * 1000L
         _session.value = PlayerSession(++generation, album, if (album.shuffle) photos.shuffled() else photos, occurrenceKey = occurrenceKey)
+        repository.setPlaying(true)
         if (album.musicEnabled) music.start(album, library.value.tracksFor(album))
     }
 
@@ -156,6 +171,7 @@ class AlbumViewModel(application: Application) : AndroidViewModel(application) {
         val current = _session.value ?: return
         if (current.token != token || current.photo.id != photoId) return
         badPhotos += photoId
+        launchOperation { repository.markUnavailable(current.photo.sourceId, photoId) }
         if (current.photos.all { it.id in badPhotos }) {
             message("此相册的图片暂时都无法读取，请检查文件夹授权或存储设备")
             stopPlayback()
@@ -183,12 +199,13 @@ class AlbumViewModel(application: Application) : AndroidViewModel(application) {
                 index = 0
             }
             if (index < 0) index = photos.lastIndex
-            if (photos[index].id !in badPhotos) {
+            if (photos[index].id !in badPhotos && library.value.playbackPhotosFor(current.album).any { it.id == photos[index].id }) {
                 dwellRemaining = current.album.intervalSeconds * 1000L
                 dwellDeadline = null
                 // A single-image album keeps its loaded frame without another transition.
                 val sameImage = photos[index].id == current.photo.id
-                _session.value = current.copy(token = if (sameImage) current.token else ++generation, photos = photos, index = index, ready = sameImage && current.ready)
+                _session.value = current.copy(token = if (sameImage) current.token else ++generation, photos = photos, index = index, ready = sameImage && current.ready,
+                    motionCycle = current.motionCycle + 1)
                 if (sameImage && current.ready && !current.paused) dwellDeadline = SystemClock.elapsedRealtime() + dwellRemaining
                 return
             }
@@ -225,6 +242,7 @@ class AlbumViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setForeground(value: Boolean) {
         foreground = value
+        repository.setForeground(value)
         if (!value) {
             pause(PauseReason.LIFECYCLE)
             music.pauseForSession()
@@ -261,6 +279,7 @@ class AlbumViewModel(application: Application) : AndroidViewModel(application) {
         }
         ++generation
         _session.value = null
+        repository.setPlaying(false)
         dwellDeadline = null
         sleepDeadline = null
         _sleepRemaining.value = null

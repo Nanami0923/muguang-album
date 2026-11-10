@@ -6,6 +6,7 @@ import android.net.Uri
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import androidx.room.Room
 import androidx.room.withTransaction
@@ -21,6 +22,16 @@ import com.muguang.album.core.PhotoScale
 import com.muguang.album.core.PlaySchedule
 import com.muguang.album.core.SortOrder
 import com.muguang.album.core.SourceKind
+import com.muguang.album.core.FocusPoint
+import com.muguang.album.core.PhotoCategory
+import com.muguang.album.core.MotionMode
+import com.muguang.album.core.PhotoMetadata
+import com.muguang.album.analysis.OfflinePhotoAnalyzer
+import com.muguang.album.playback.stableAutoFocus
+import com.muguang.album.playback.TRASH_RETENTION_MILLIS
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.asCoroutineDispatcher
+import java.util.concurrent.Executors
 import java.io.IOException
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -48,7 +59,7 @@ private val Context.albumPreferences by preferencesDataStore(name = "album_prefe
 class LocalAlbumRepository(context: Context, scope: CoroutineScope) : AlbumRepository {
     private val appContext = context.applicationContext
     private val resolver = appContext.contentResolver
-    private val database = Room.databaseBuilder(appContext, AlbumDatabase::class.java, "muguang-album.db").build()
+    private val database = Room.databaseBuilder(appContext, AlbumDatabase::class.java, "muguang-album.db").addMigrations(SMART_MIGRATION).build()
     private val dao = database.dao()
     private val scanner = SafScanner(resolver)
     private val mutationMutex = Mutex()
@@ -58,6 +69,19 @@ class LocalAlbumRepository(context: Context, scope: CoroutineScope) : AlbumRepos
     private val initialized = MutableStateFlow(false)
     private val mutableState = MutableStateFlow(LibraryState())
     override val state: StateFlow<LibraryState> = mutableState.asStateFlow()
+    @Volatile private var foreground = false
+    @Volatile private var playing = false
+    @Volatile private var playbackBackoffUntil = 0L
+    private val inferenceDispatcher = Executors.newSingleThreadExecutor { task ->
+        Thread({ android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND); task.run() }, "photo-analysis")
+    }.asCoroutineDispatcher()
+    private val analyzer by lazy { OfflinePhotoAnalyzer(appContext) }
+
+    override fun setForeground(value: Boolean) { foreground = value }
+    override fun setPlaying(value: Boolean) { playing = value }
+    override fun reportPlaybackFrame(millis: Long) {
+        if (millis > 80) playbackBackoffUntil = android.os.SystemClock.elapsedRealtime() + 5000
+    }
 
     init {
         val storedLibrary = combine(
@@ -66,7 +90,7 @@ class LocalAlbumRepository(context: Context, scope: CoroutineScope) : AlbumRepos
             LibraryState(
                 albums = albums.map { it.model() },
                 sources = sources.map { it.model() },
-                photos = photos.map { Photo(it.id, it.sourceId, it.uri, it.name, it.modifiedAt) },
+                photos = photos.map { Photo(it.id, it.sourceId, it.uri, it.name, it.modifiedAt, it.fileSize, it.trashedAt, it.unavailableReason, it.metadata) },
                 tracks = tracks.map { MusicTrack(it.id, it.sourceId, it.uri, it.name) },
                 schedules = schedules.map { it.model() },
             )
@@ -80,6 +104,7 @@ class LocalAlbumRepository(context: Context, scope: CoroutineScope) : AlbumRepos
                 showClock = it[SHOW_CLOCK] ?: false,
                 standbyBrightness = (it[STANDBY_BRIGHTNESS] ?: .04f).coerceIn(.01f, 1f),
                 remindersEnabled = it[REMINDERS_ENABLED] ?: false,
+                galleryColumns = (it[GALLERY_COLUMNS] ?: 2).coerceIn(1, 2),
             )
         }
         scope.launch(Dispatchers.IO) {
@@ -87,12 +112,62 @@ class LocalAlbumRepository(context: Context, scope: CoroutineScope) : AlbumRepos
                 library.copy(preferences = prefs, scanningSourceIds = scanningIds, initialized = ready)
             }.collect { mutableState.value = it }
         }
+        scope.launch(Dispatchers.IO) {
+            var lastPurge = 0L
+            while (true) {
+                if (!foreground || !initialized.value) { delay(500); continue }
+                if (playing && android.os.SystemClock.elapsedRealtime() < playbackBackoffUntil) { delay(500); continue }
+                if (android.os.Build.VERSION.SDK_INT >= 29 &&
+                    (appContext.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager).currentThermalStatus >= android.os.PowerManager.THERMAL_STATUS_MODERATE) { delay(2000); continue }
+                if (System.currentTimeMillis() - lastPurge > 60_000) {
+                    mutationMutex.withLock { dao.purgeTrash(System.currentTimeMillis() - TRASH_RETENTION_MILLIS) }
+                    lastPurge = System.currentTimeMillis()
+                }
+                val photo = mutationMutex.withLock {
+                    dao.nextAnalysis()?.also { dao.insertPhotos(listOf(it.copy(metadata = it.metadata.copy(taskState = "PROCESSING")))) }
+                }
+                if (photo == null) { delay(700); continue }
+                val cached = dao.photosById(photo.id).firstOrNull { it.sourceId != photo.sourceId && it.trashedAt == null &&
+                    it.modifiedAt == photo.modifiedAt && it.fileSize == photo.fileSize && it.metadata.taskState == "DONE" && it.metadata.modelVersion == OfflinePhotoAnalyzer.VERSION }
+                var missing = false
+                val result = try { cached?.metadata ?: withContext(inferenceDispatcher) { analyzer.analyze(photo.uri) } }
+                catch (cancelled: CancellationException) { throw cancelled }
+                catch (error: Exception) {
+                    missing = error is SecurityException || error is java.io.FileNotFoundException
+                    PhotoMetadata(taskState = "FAILED", focusStatus = "ERROR", classificationStatus = "ERROR", error = error.message?.take(200) ?: "识别失败")
+                }
+                catch (error: LinkageError) { PhotoMetadata(taskState = "FAILED", focusStatus = "ERROR", classificationStatus = "ERROR", error = "设备不支持当前离线识别组件") }
+                mutationMutex.withLock {
+                    val latest = dao.photo(photo.sourceId, photo.id)
+                    if (latest != null && latest.trashedAt == null && latest.modifiedAt == photo.modifiedAt && latest.fileSize == photo.fileSize && latest.metadata.taskState == "PROCESSING") {
+                        val manual = latest.metadata
+                        val point = stableAutoFocus(manual.autoFocus, result.autoFocus, result.orientedWidth, result.orientedHeight)
+                        val source = dao.source(photo.sourceId)
+                        val merged = if (!foreground || source?.analysisState == "CANCELLED") manual.copy(taskState = if (source?.analysisState == "CANCELLED") "CANCELLED" else "QUEUED")
+                        else result.copy(autoX = point?.x, autoY = point?.y, manualX = manual.manualX, manualY = manual.manualY,
+                            manualCategory = manual.manualCategory, customMotionMode = manual.customMotionMode,
+                            focusStatus = when { manual.manualFocus != null -> "MANUAL"; result.focusStatus != "MANUAL" -> result.focusStatus;
+                                point != null -> "DETECTED"; else -> "NEEDS_MANUAL" })
+                        dao.insertPhotos(listOf(latest.copy(metadata = merged, trashedAt = if (missing) System.currentTimeMillis() else latest.trashedAt,
+                            unavailableReason = if (missing) "文件不存在或授权失效" else latest.unavailableReason)))
+                    }
+                }
+                // Yield between pictures; playback never waits for model inference.
+                delay(if (playing) 1500 else 100)
+            }
+        }
     }
 
     override suspend fun initialize(): Unit = withContext(Dispatchers.IO) {
         initializeMutex.withLock {
             if (initialized.value) return@withLock
             mutationMutex.withLock {
+                dao.purgeTrash(System.currentTimeMillis() - TRASH_RETENTION_MILLIS)
+                dao.recoverAnalysis()
+                for (source in dao.sources()) {
+                    val stale = dao.sourcePhotos(source.id).filter { it.metadata.taskState == "DONE" && it.metadata.modelVersion != OfflinePhotoAnalyzer.VERSION }
+                    stale.chunked(200).forEach { chunk -> dao.insertPhotos(chunk.map { it.copy(metadata = it.metadata.copy(taskState = "QUEUED")) }) }
+                }
                 if (dao.albums().isEmpty()) dao.insertAlbum(Album(DEFAULT_ALBUM_ID, "家庭相册").entity())
                 for (source in dao.sources()) {
                     currentCoroutineContext().ensureActive()
@@ -103,6 +178,7 @@ class LocalAlbumRepository(context: Context, scope: CoroutineScope) : AlbumRepos
                         throw cancelled
                     } catch (failure: Exception) {
                         dao.updateAvailability(source.id, false, readableError(failure))
+                        if (failure is SecurityException || failure is java.io.FileNotFoundException) dao.trashSource(source.id, System.currentTimeMillis(), readableError(failure))
                     }
                 }
             }
@@ -122,6 +198,9 @@ class LocalAlbumRepository(context: Context, scope: CoroutineScope) : AlbumRepos
         require(album.intervalSeconds in 1..3600) { "换片间隔应为 1～3600 秒" }
         require(album.musicVolume.isFinite() && album.musicVolume in 0f..1f) { "音乐音量应在 0～100% 之间" }
         require(album.transitionMillis in 0..2000) { "转场时长应为 0～2000 毫秒" }
+        require(album.motionStrength.isFinite() && album.motionStrength in 0f..0.5f) { "动画强度无效" }
+        require(album.maxCrop.isFinite() && album.maxCrop in 0f..0.85f) { "裁剪上限无效" }
+        require(album.playbackCategories.split(',').filter { it.isNotBlank() }.all { name -> PhotoCategory.entries.any { it.name == name } }) { "播放类别无效" }
         mutationMutex.withLock {
             check(dao.album(album.id) != null) { "此相册已不存在" }
             val musicSource = album.musicSourceId?.let { dao.source(it) }
@@ -130,11 +209,14 @@ class LocalAlbumRepository(context: Context, scope: CoroutineScope) : AlbumRepos
             }
             require(!album.musicEnabled || musicSource != null) { "请先选择音乐文件夹" }
             val safeAlbum = album.copy(name = cleanName, transitionMillis = minOf(album.transitionMillis, album.intervalSeconds * 500))
+            database.withTransaction {
             dao.updateAlbum(
                 safeAlbum.id, safeAlbum.name, safeAlbum.intervalSeconds, safeAlbum.shuffle, safeAlbum.loop,
                 safeAlbum.sortOrder.name, safeAlbum.scale.name, safeAlbum.transitionMillis,
                 safeAlbum.musicSourceId, safeAlbum.musicEnabled, safeAlbum.musicOrder.name, safeAlbum.musicVolume,
             )
+            dao.smartSettings(album.id, album.motionMode.name, album.motionStrength, album.maxCrop, album.blurBackground, album.playbackCategories)
+            }
         }
     }
 
@@ -221,12 +303,12 @@ class LocalAlbumRepository(context: Context, scope: CoroutineScope) : AlbumRepos
                     // A changed/removed source invalidates a result even if the provider finished late.
                     if (latest != null && latest.uri == source.uri && latest.recursive == source.recursive) {
                         database.withTransaction {
-                            dao.deleteSourcePhotos(sourceId)
-                            dao.deleteSourceTracks(sourceId)
-                            for (chunk in result.photos.chunked(200)) {
+                            val updated = reconcilePhotos(dao.sourcePhotos(sourceId), result.photos, System.currentTimeMillis())
+                            for (chunk in updated.chunked(200)) {
                                 currentCoroutineContext().ensureActive()
                                 dao.insertPhotos(chunk)
                             }
+                            dao.deleteSourceTracks(sourceId)
                             for (chunk in result.tracks.chunked(200)) {
                                 currentCoroutineContext().ensureActive()
                                 dao.insertTracks(chunk)
@@ -240,11 +322,56 @@ class LocalAlbumRepository(context: Context, scope: CoroutineScope) : AlbumRepos
                 throw cancelled
             } catch (failure: Exception) {
                 val error = readableError(failure)
-                mutationMutex.withLock { dao.updateAvailability(sourceId, false, error) }
+                mutationMutex.withLock {
+                    dao.updateAvailability(sourceId, false, error)
+                    if (failure is SecurityException || failure is java.io.FileNotFoundException) dao.trashSource(sourceId, System.currentTimeMillis(), error)
+                }
                 throw IllegalStateException(error, failure)
             } finally {
                 scanning.update { it - sourceId }
             }
+        }
+    }
+
+    override suspend fun savePhotoEdits(sourceId: String, photoId: String, focus: FocusPoint?, category: PhotoCategory?, motion: MotionMode?) = withContext(Dispatchers.IO) {
+        require(focus == null || (focus.x.isFinite() && focus.y.isFinite() && focus.x in 0f..1f && focus.y in 0f..1f))
+        mutationMutex.withLock {
+            val old = checkNotNull(dao.photo(sourceId, photoId)) { "照片索引已不存在" }
+            dao.insertPhotos(dao.photosById(old.id).map { shared -> shared.copy(metadata = shared.metadata.copy(manualX = focus?.x, manualY = focus?.y,
+                manualCategory = category?.name, customMotionMode = motion?.name,
+                focusStatus = when { focus != null -> "MANUAL"; shared.metadata.autoFocus != null -> "DETECTED";
+                    shared.metadata.taskState == "FAILED" -> "ERROR"; shared.metadata.taskState in setOf("QUEUED", "PROCESSING") -> "PENDING"; else -> "NEEDS_MANUAL" })) })
+        }
+    }
+
+    override suspend fun setAnalysisState(sourceId: String, command: String) = withContext(Dispatchers.IO) {
+        if (command == "RESCAN") scan(sourceId)
+        mutationMutex.withLock {
+            val photos = dao.sourcePhotos(sourceId)
+            val state = when (command) { "PAUSE" -> "PAUSED"; "CANCEL" -> "CANCELLED"; else -> "RUNNING" }
+            dao.analysisState(sourceId, state)
+            val updates = photos.filter { it.trashedAt == null }.mapNotNull { photo ->
+                val task = photo.metadata.taskState
+                val next = when {
+                    command == "CANCEL" && task in setOf("QUEUED", "PROCESSING") -> "CANCELLED"
+                    command == "RESCAN" || (command == "RETRY" && task == "FAILED") || (command == "RESUME" && task == "CANCELLED") -> "QUEUED"
+                    else -> null
+                }
+                next?.let { photo.copy(metadata = photo.metadata.copy(taskState = it, error = null)) }
+            }
+            updates.chunked(200).forEach { dao.insertPhotos(it) }
+        }
+    }
+
+    override suspend fun markUnavailable(sourceId: String, photoId: String): Unit = withContext(Dispatchers.IO) {
+        val photo = dao.photo(sourceId, photoId) ?: return@withContext
+        // Unsupported codecs/corrupt images remain technical errors, not missing files.
+        try { resolver.openInputStream(Uri.parse(photo.uri))?.use { it.read() }; return@withContext }
+        catch (_: SecurityException) { }
+        catch (_: java.io.FileNotFoundException) { }
+        catch (_: Exception) { return@withContext }
+        mutationMutex.withLock {
+            dao.photo(sourceId, photoId)?.let { dao.insertPhotos(listOf(it.copy(trashedAt = it.trashedAt ?: System.currentTimeMillis(), unavailableReason = "文件不存在或授权失效"))) }
         }
     }
 
@@ -282,6 +409,7 @@ class LocalAlbumRepository(context: Context, scope: CoroutineScope) : AlbumRepos
             it[SHOW_CLOCK] = preferences.showClock
             it[STANDBY_BRIGHTNESS] = preferences.standbyBrightness.coerceIn(.01f, 1f)
             it[REMINDERS_ENABLED] = preferences.remindersEnabled
+            it[GALLERY_COLUMNS] = preferences.galleryColumns.coerceIn(1, 2)
         }
     }
 
@@ -318,6 +446,7 @@ class LocalAlbumRepository(context: Context, scope: CoroutineScope) : AlbumRepos
         private val SHOW_CLOCK = booleanPreferencesKey("show_clock")
         private val STANDBY_BRIGHTNESS = floatPreferencesKey("standby_brightness")
         private val REMINDERS_ENABLED = booleanPreferencesKey("reminders_enabled")
+        private val GALLERY_COLUMNS = intPreferencesKey("gallery_columns")
 
         /** Monday is bit 0. Split wrap-around ranges before comparing half-open intervals. */
         internal fun weeklyOverlap(first: PlaySchedule, second: PlaySchedule): Boolean {
@@ -341,15 +470,17 @@ class LocalAlbumRepository(context: Context, scope: CoroutineScope) : AlbumRepos
 private fun Album.entity() = AlbumEntity(
     id, name, intervalSeconds, shuffle, loop, sortOrder.name, scale.name, transitionMillis,
     musicSourceId, musicEnabled, musicOrder.name, musicVolume,
+    motionMode.name, motionStrength, maxCrop, blurBackground, playbackCategories,
 )
 
 private fun AlbumEntity.model() = Album(
     id, name, intervalSeconds, shuffle, loop, SortOrder.valueOf(sortOrder), PhotoScale.valueOf(scale), transitionMillis,
     musicSourceId, musicEnabled, MusicOrder.valueOf(musicOrder), musicVolume,
+    MotionMode.valueOf(motionMode), motionStrength, maxCrop, blurBackground, playbackCategories,
 )
 
 private fun SourceEntity.model() = FolderSource(
-    id, albumId, uri, name, SourceKind.valueOf(kind), recursive, available, error, lastScanAt,
+    id, albumId, uri, name, SourceKind.valueOf(kind), recursive, available, error, lastScanAt, analysisState,
 )
 
 private fun PlaySchedule.entity() = ScheduleEntity(

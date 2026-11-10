@@ -36,6 +36,8 @@ jobs:
           packages: 'platform-tools platforms;android-36 build-tools;36.0.0 build-tools;35.0.0'
       - name: Build, run unit tests and lint
         run: ./gradlew --no-daemon --console=plain :app:assembleDebug :app:testDebugUnitTest :app:lintDebug
+      - name: Verify native ELF and APK alignment
+        run: python3 scripts/check_native_alignment.py app/build/outputs/apk/debug/app-debug.apk --json app/build/reports/native-alignment.json
       - name: Keep test and lint reports
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
@@ -45,5 +47,6 @@ jobs:
             app/build/reports/tests/testDebugUnitTest/
             app/build/test-results/testDebugUnitTest/*.xml
             app/build/reports/lint-results-debug.*
+            app/build/reports/native-alignment.json
           retention-days: 7
           if-no-files-found: warn
