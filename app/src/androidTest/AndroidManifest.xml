@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <provider
+            android:name="com.muguang.album.integration.TestDocumentsProvider"
+            android:authorities="com.muguang.album.integration.synthetic.documents"
+            android:exported="true"
+            android:grantUriPermissions="true"
+            android:label="暮光合成测试素材"
+            android:permission="android.permission.MANAGE_DOCUMENTS">
+            <intent-filter>
+                <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
+            </intent-filter>
+        </provider>
+        <activity
+            android:name="com.muguang.album.integration.SyntheticGrantActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.NoDisplay" />
+    </application>
+</manifest>
